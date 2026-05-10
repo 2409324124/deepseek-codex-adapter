@@ -75,7 +75,7 @@ The proxy allocates each output item an index when it first appears and reuses i
 
 ### 5. Failures Need Minimal, Bounded Reproduction
 
-Codex often reports protocol errors as `stream disconnected` reconnect loops. The proxy logs DeepSeek HTTP errors without printing secrets, and the skill requires 60 second bounded tests to avoid long retry loops.
+Codex often reports protocol errors as `stream disconnected` reconnect loops. The proxy logs DeepSeek HTTP errors without printing secrets, and the skill recommends bounded tests to avoid long retry loops.
 
 ## Difference From Common Relay Solutions
 

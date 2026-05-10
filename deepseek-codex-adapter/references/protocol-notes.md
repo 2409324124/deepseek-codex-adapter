@@ -46,7 +46,7 @@ Then each result must follow as a separate Chat tool message using the matching 
 
 - Codex `stream disconnected` retry loop
   - Cause: often a DeepSeek 400 wrapped inside a Responses stream, malformed SSE events, or invalid output indexes.
-  - Fix: inspect proxy logs, then run a 60 second minimal reproduction before changing broader repo-analysis prompts.
+  - Fix: inspect proxy logs, then run a bounded minimal reproduction before changing broader repo-analysis prompts.
 
 ## Minimum Validation Matrix
 

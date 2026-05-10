@@ -18,7 +18,7 @@ description: Set up, debug, and validate a local OpenAI Responses-compatible pro
    - same-turn parallel tool calls
    - same-turn parallel tool calls with one expected failure and a recovery turn
    - bounded repository analysis that excludes secrets
-6. Put a timeout around every Codex validation command. Use `timeout 60s ...` unless the user asks for a different limit.
+6. Use a bounded timeout around Codex validation commands so reconnect loops do not run indefinitely. Choose the limit from the user request or local policy; `timeout 60s` is only an example.
 
 ## Setup Pattern
 
@@ -53,13 +53,13 @@ codex --profile deepseek "$@"
 Use temporary or read-only workdirs for the first tests:
 
 ```bash
-timeout 60s codex --profile deepseek exec -C /tmp/deepseek-codex-test --skip-git-repo-check --sandbox read-only "Run pwd, then summarize."
+timeout <seconds> codex --profile deepseek exec -C /tmp/deepseek-codex-test --skip-git-repo-check --sandbox read-only "Run pwd, then summarize."
 ```
 
 For repository-level testing, explicitly exclude sensitive paths:
 
 ```bash
-timeout 60s codex --profile deepseek exec -C "$PWD" --sandbox read-only \
+timeout <seconds> codex --profile deepseek exec -C "$PWD" --sandbox read-only \
   "List files with rg --files while excluding .env, .key, .git, node_modules, test-results, token, secret, credential files. Read only package manifests and safe entrypoint snippets. Do not modify files."
 ```
 
