@@ -1,0 +1,11 @@
+.env
+.key
+*.key
+*.pem
+*.p12
+*.pfx
+__pycache__/
+*.py[cod]
+.DS_Store
+node_modules/
+test-results/

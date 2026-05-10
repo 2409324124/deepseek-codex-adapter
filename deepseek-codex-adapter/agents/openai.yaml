@@ -1,0 +1,4 @@
+interface:
+  display_name: "DeepSeek Codex Adapter"
+  short_description: "Set up and validate a local DeepSeek Responses proxy for Codex."
+  default_prompt: "Set up DeepSeek as a Codex model backend."
