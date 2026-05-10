@@ -66,6 +66,29 @@ Validated locally against:
 - parallel call with one expected failure and a recovery call
 - bounded read-only repository analysis excluding `.env`, `.key`, `.git`, `node_modules`, and test output folders
 
+## API Key
+
+Put the DeepSeek key in a local `.env` file next to where you start the proxy:
+
+```env
+DEEPSEEK_API_KEY=your_deepseek_key
+```
+
+Then run:
+
+```bash
+python3 deepseek-codex-adapter/scripts/deepseek_responses_proxy.py --env-file .env
+```
+
+Alternatively, export the key in the shell:
+
+```bash
+export DEEPSEEK_API_KEY=your_deepseek_key
+python3 deepseek-codex-adapter/scripts/deepseek_responses_proxy.py
+```
+
+Do not put API keys in Codex config, `SKILL.md`, GitHub, wrapper scripts, or systemd unit files.
+
 ## Repository Layout
 
 ```text

@@ -22,7 +22,7 @@ description: Set up, debug, and validate a local OpenAI Responses-compatible pro
 
 ## Setup Pattern
 
-Create or reuse a local env file containing `DEEPSEEK_API_KEY`, then start the proxy:
+Create or reuse a local env file containing `DEEPSEEK_API_KEY`, then start the proxy. The key belongs in the local `.env` file or shell environment, not in Codex config, GitHub, wrapper scripts, or systemd unit files.
 
 ```bash
 python3 scripts/deepseek_responses_proxy.py --host 127.0.0.1 --port 4000 --env-file .env
