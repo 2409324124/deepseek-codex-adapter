@@ -18,7 +18,7 @@ description: Set up, debug, and validate a local OpenAI Responses-compatible pro
    - same-turn parallel tool calls
    - same-turn parallel tool calls with one expected failure and a recovery turn
    - bounded repository analysis that excludes secrets
-6. Use a bounded timeout around Codex validation commands so reconnect loops do not run indefinitely. Choose the limit from the user request or local policy; `timeout 60s` is only an example.
+6. Use a bounded timeout around Codex validation commands so reconnect loops do not run indefinitely. Choose the limit from the user request or local policy; use `timeout <seconds>` in examples.
 
 ## Setup Pattern
 
