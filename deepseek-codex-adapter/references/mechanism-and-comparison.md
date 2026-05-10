@@ -103,11 +103,23 @@ This adapter targets Codex specifically:
 - It intentionally disables DeepSeek thinking mode to avoid unsupported reasoning-content round-trips.
 - It includes a validation matrix for real Codex agent behavior, not just a single chat prompt.
 
-### MCP or Sub-Agent Setups
+### MCP Driver Setups
 
-MCP can expose DeepSeek as a callable tool, but the active Codex model still does the planning and sampling. That is useful for consultation, not for replacing Codex's main model backend.
+MCP can expose DeepSeek as a callable tool, but the active Codex model still does the planning and sampling. That is useful for consultation, bounded file scans, and patch drafts, not for replacing Codex's main model backend.
 
 This adapter instead makes DeepSeek the model provider that Codex samples from.
+
+This skill also includes a Dockerized MCP driver for the complementary workflow:
+
+```text
+Codex/OpenAI driver
+  -> deepseek-driver MCP whitelist tool
+  -> local Responses proxy
+  -> DeepSeek
+  -> saved artifacts under artifacts/deepseek/<run-id>/
+```
+
+That MCP driver is intentionally narrower than common "shell MCP" approaches. `deepseek_scan` and `deepseek_patch` read only allow-listed non-sensitive files, call the local Responses proxy directly, and save artifacts. They do not start a nested Codex process and do not give DeepSeek repository shell access.
 
 ### Hosted LiteLLM-Style Gateways
 

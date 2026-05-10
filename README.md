@@ -1,6 +1,6 @@
 # DeepSeek Codex Adapter
 
-Experimental Codex skill and local Responses-compatible proxy for using DeepSeek Chat models as a Codex model provider.
+Experimental Codex skill and local Responses-compatible proxy for using DeepSeek Chat models as a Codex model provider. It also includes a Dockerized MCP driver for the complementary workflow where Codex stays in control and DeepSeek performs bounded scan/patch tasks as a tool backend.
 
 ## What It Solves
 
@@ -14,6 +14,7 @@ This project provides a local adapter that:
 - supports Codex shell/tool calls, multi-turn continuation, and same-turn parallel tool calls
 - disables DeepSeek thinking mode to avoid unsupported `reasoning_content` round-trips during tool use
 - includes bounded smoke tests for real Codex agent workflows
+- packages a narrow MCP driver for Docker image probes and allow-listed DeepSeek scan/patch artifacts
 
 ## How It Works
 
@@ -51,6 +52,13 @@ This adapter is Codex-specific:
 
 MCP is a different solution category: MCP can expose DeepSeek as a tool, but it does not make DeepSeek the Codex sampling model. This adapter targets the model-provider layer.
 
+This repository includes both layers:
+
+- `deepseek_responses_proxy.py`: makes DeepSeek usable behind Codex's Responses-style provider path.
+- `deepseek_driver_mcp.py`: lets an OpenAI/Codex driver call DeepSeek through whitelist tools and saved artifacts.
+
+The MCP driver does not expose arbitrary shell access. Its DeepSeek tools read only allow-listed non-sensitive files, call the local Responses proxy directly, and save `prompt.md`, `deepseek-output.md`, and optional `patch.diff` under `artifacts/deepseek/<run-id>/`.
+
 Hosted LiteLLM-style gateways can be useful, but they broaden the trust boundary. This project defaults to a local Python standard-library proxy bound to `127.0.0.1`, so the DeepSeek API key stays on the user's machine.
 
 ## Status
@@ -65,6 +73,13 @@ Validated locally against:
 - same-turn parallel shell tool calls
 - parallel call with one expected failure and a recovery call
 - bounded read-only repository analysis excluding `.env`, `.key`, `.git`, `node_modules`, and test output folders
+- Dockerized MCP protocol self-test with `tools/list`, PyTorch image probe, sensitive path rejection, `deepseek_scan`, and `deepseek_patch`
+
+Known Codex CLI boundary:
+
+- Direct MCP protocol calls to the Dockerized server work.
+- Non-interactive Codex MCP tool calls may require the user's Codex CLI approval/trust mode. In local Codex CLI 0.125.0 testing, `--dangerously-bypass-approvals-and-sandbox` could call MCP tools, while default `codex exec --sandbox read-only` returned `user cancelled MCP tool call`.
+- Use the normal Codex/OpenAI driver for MCP orchestration. Do not use the DeepSeek profile as the outer driver for MCP tool testing.
 
 ## API Key
 
@@ -95,8 +110,12 @@ Do not put API keys in Codex config, `SKILL.md`, GitHub, wrapper scripts, or sys
 deepseek-codex-adapter/
 ├── SKILL.md
 ├── agents/openai.yaml
-├── scripts/deepseek_responses_proxy.py
+├── docker/mcp-driver.Dockerfile
+├── scripts/
+│   ├── deepseek_driver_mcp.py
+│   └── deepseek_responses_proxy.py
 └── references/
+    ├── mcp-driver-workflow.md
     ├── protocol-notes.md
     ├── mechanism-and-comparison.md
     └── github-publish-checklist.md

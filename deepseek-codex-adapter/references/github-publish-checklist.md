@@ -8,9 +8,12 @@ Publish only the skill folder contents:
 deepseek-codex-adapter/
 ├── SKILL.md
 ├── agents/openai.yaml
+├── docker/mcp-driver.Dockerfile
+├── scripts/deepseek_driver_mcp.py
 ├── scripts/deepseek_responses_proxy.py
 └── references/
     ├── protocol-notes.md
+    ├── mcp-driver-workflow.md
     ├── mechanism-and-comparison.md
     └── github-publish-checklist.md
 ```
@@ -31,7 +34,9 @@ Run from the skill folder or parent workspace:
 
 ```bash
 python3 -m py_compile scripts/deepseek_responses_proxy.py
+python3 -m py_compile scripts/deepseek_driver_mcp.py
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
+docker build -t deepseek-driver-mcp:local -f docker/mcp-driver.Dockerfile .
 find . -type f | sort
 ```
 
