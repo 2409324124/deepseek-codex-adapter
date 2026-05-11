@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from test_mcp_output_validation import DRIVER_PATH, load_driver
@@ -29,7 +30,18 @@ def test_make_patch_id_does_not_leak_paths_or_secrets(tmp_path, monkeypatch):
     assert "/" not in patch_id
     assert "home" not in patch_id
     assert fake not in patch_id
-    assert patch_id.endswith(driver.sha256_text(patch_text)[:8])
+    assert patch_id.endswith(driver.sha256_text(patch_text)[:12])
+    assert re.fullmatch(r"candidate_\d{16,20}_[a-f0-9]{12}", patch_id)
+
+
+def test_make_patch_id_does_not_collide_for_same_patch_same_second(tmp_path, monkeypatch):
+    driver, _repo = load_driver(tmp_path, monkeypatch)
+
+    first = driver.make_patch_id("candidate", VALID_DIFF)
+    second = driver.make_patch_id("candidate", VALID_DIFF)
+
+    assert first != second
+    assert first.rsplit("_", 1)[-1] == second.rsplit("_", 1)[-1]
 
 
 def test_deepseek_patch_candidate_artifact_shape(tmp_path, monkeypatch):

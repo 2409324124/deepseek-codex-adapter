@@ -36,7 +36,7 @@ HARD_SENSITIVE_WORDS = ("secret", "credential", "private_key", "apikey", "api_ke
 SOFT_SENSITIVE_WORDS = ("token", "auth", "password", "session")
 IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,255}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
-PATCH_ID_RE = re.compile(r"^(candidate|validated)_\d{8}_\d{6}_[a-f0-9]{8}$")
+PATCH_ID_RE = re.compile(r"^(candidate|validated)_\d{16,20}_[a-f0-9]{12}$")
 POLICY_PROFILES = ("strict-secrets", "ml-code", "web-app")
 DEFAULT_RESPONSES_BASE_URL = "http://127.0.0.1:4000/v1"
 MAX_ALLOWED_FILES = 80
@@ -196,15 +196,11 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def timestamp_id_part() -> str:
-    return time.strftime("%Y%m%d_%H%M%S", time.localtime())
-
-
 def make_patch_id(prefix: str, patch_text: str) -> str:
     if prefix not in {"candidate", "validated"}:
         raise ValueError("patch id prefix must be candidate or validated")
-    digest = sha256_text(patch_text)[:8]
-    return f"{prefix}_{timestamp_id_part()}_{digest}"
+    digest = sha256_text(patch_text)[:12]
+    return f"{prefix}_{time.time_ns()}_{digest}"
 
 
 def patch_artifact_dir(patch_id: str) -> Path:
