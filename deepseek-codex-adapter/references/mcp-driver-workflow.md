@@ -53,7 +53,7 @@ tool_timeout_sec = 600
 - `harness_policy_check(run_id, repo_paths, artifact_paths, image, test_template, policy_profile)`: checks paths, image names, and test templates against the harness policy.
 - `harness_write_file(run_id, relative_path, content)`: writes only inside the harness artifact workspace and records bytes plus sha256.
 - `deepseek_generate_artifact_file(run_id, task, allow_paths, output_path, language, timeout, attempt_label)`: calls DeepSeek, requires exactly one fenced code block, writes the latest artifact, and stores a versioned attempt copy plus extraction metadata.
-- `harness_run_temp_script(run_id, image, script_path, timeout, network_disabled=True, attempt_label=None)`: runs an artifact Python script in Docker with `/repo` read-only and `/artifact` read-write. When `attempt_label` is set, the log path is versioned.
+- `harness_run_temp_script(run_id, image, script_path, timeout, network_disabled=True, attempt_label=None)`: runs an artifact Python script in Docker with `/repo` read-only and `/artifact` read-write. When `attempt_label` is set, the log path is versioned. Use returned `log_relative_path` when calling `harness_static_assertions(log_path=...)`.
 - `harness_static_assertions(run_id, ...)`: checks generated code, stdout/stderr, return code, runtime, required markers, and task-specific forbidden strings. The default `ml-code` profile does not treat `token` as forbidden code.
 - `harness_create_worktree(run_id, base_ref="working-copy")`: creates a sanitized isolated repository copy under the harness workspace.
 - `harness_apply_patch(run_id, patch_path, timeout=120)`: runs `git apply --check` and applies the patch only inside the isolated worktree.

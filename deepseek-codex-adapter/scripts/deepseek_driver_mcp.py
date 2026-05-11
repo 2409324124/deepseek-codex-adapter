@@ -922,7 +922,14 @@ def harness_run_temp_script(
     else:
         log_path = root / "logs" / f"{script.stem}.log"
     log_path.write_text(result.get("stdout", "") + result.get("stderr", ""), encoding="utf-8")
-    result.update({"run_id": run_id, "log_path": str(log_path), "script_sha256": sha256_file(script)})
+    result.update(
+        {
+            "run_id": run_id,
+            "log_path": str(log_path),
+            "log_relative_path": str(log_path.relative_to(root)),
+            "script_sha256": sha256_file(script),
+        }
+    )
     return result
 
 
@@ -1113,7 +1120,14 @@ def harness_run_repo_tests(
     )
     log_path = root / "logs" / f"tests-{test_template.replace(' ', '-')}.log"
     log_path.write_text(result.get("stdout", "") + result.get("stderr", ""), encoding="utf-8")
-    result.update({"run_id": run_id, "log_path": str(log_path), "test_template": test_template})
+    result.update(
+        {
+            "run_id": run_id,
+            "log_path": str(log_path),
+            "log_relative_path": str(log_path.relative_to(root)),
+            "test_template": test_template,
+        }
+    )
     return result
 
 

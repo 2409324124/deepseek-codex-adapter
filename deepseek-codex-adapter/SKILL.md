@@ -56,7 +56,7 @@ tool_timeout_sec = 600
    - `docker_probe_torch(image="cat-psych:cpu")` returns the PyTorch version when that image exists locally.
    - `deepseek_scan` succeeds on an allow-listed non-sensitive file and writes `artifacts/deepseek/<run-id>/deepseek-output.md`.
    - `deepseek_generate_artifact_file` extracts exactly one fenced code block, writes a latest artifact, and preserves a versioned attempt copy.
-   - `harness_run_temp_script` can run an artifact-only Python script with `/repo` read-only and `/artifact` writable.
+   - `harness_run_temp_script` can run an artifact-only Python script with `/repo` read-only and `/artifact` writable; use `log_relative_path` with `harness_static_assertions(log_path=...)`.
    - `harness_static_assertions` validates return codes, stdout markers, code snippets, and task-specific forbidden strings.
    - `harness_apply_patch` applies a patch only to an isolated harness worktree, never the real repository.
    - `harness_run_repo_tests` runs only an allow-listed test template such as `python -m pytest`.
