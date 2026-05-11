@@ -31,9 +31,11 @@ from mcp.server.fastmcp import FastMCP
 
 
 SENSITIVE_NAMES = {".env", ".key", ".git", "node_modules", "test-results", "__pycache__"}
-SENSITIVE_WORDS = ("secret", "token", "credential", "private_key", "apikey", "api_key")
+HARD_SENSITIVE_WORDS = ("secret", "credential", "private_key", "apikey", "api_key")
+SOFT_SENSITIVE_WORDS = ("token", "auth", "password", "session")
 IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,255}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
+POLICY_PROFILES = ("strict-secrets", "ml-code", "web-app")
 DEFAULT_RESPONSES_BASE_URL = "http://127.0.0.1:4000/v1"
 MAX_ALLOWED_FILES = 80
 DEFAULT_MAX_FILE_BYTES = 120_000
@@ -44,6 +46,14 @@ ALLOWED_TEST_TEMPLATES = {
     "pytest": ["pytest"],
     "python -m pytest": ["python", "-m", "pytest"],
     "npm test": ["npm", "test"],
+}
+LANGUAGE_EXTENSIONS = {
+    "python": ".py",
+    "py": ".py",
+    "javascript": ".js",
+    "typescript": ".ts",
+    "markdown": ".md",
+    "text": ".txt",
 }
 
 
@@ -75,6 +85,33 @@ def validate_run_id(run_id: str | None, fallback: str) -> str:
     return value
 
 
+def validate_policy_profile(policy_profile: str | None) -> str:
+    profile = policy_profile or "strict-secrets"
+    if profile not in POLICY_PROFILES:
+        raise ValueError(f"unsupported policy_profile: {profile}")
+    return profile
+
+
+def path_policy_findings(rel: Path | str, *, policy_profile: str | None = None) -> dict[str, Any]:
+    profile = validate_policy_profile(policy_profile)
+    path = Path(rel)
+    parts = set(path.parts)
+    lowered = str(path).lower()
+    hard_hits = sorted((parts & SENSITIVE_NAMES) | {word for word in HARD_SENSITIVE_WORDS if word in lowered})
+    soft_hits = sorted(word for word in SOFT_SENSITIVE_WORDS if word in lowered)
+    allowed = not hard_hits
+    if profile == "web-app" and any(word in lowered for word in ("password", "session")):
+        allowed = False
+        hard_hits = sorted(set(hard_hits) | {word for word in ("password", "session") if word in lowered})
+        soft_hits = [word for word in soft_hits if word not in hard_hits]
+    return {
+        "allowed": allowed,
+        "policy_profile": profile,
+        "hard_hits": hard_hits,
+        "soft_hits": soft_hits,
+    }
+
+
 def validate_repo_path(raw_path: str, *, must_exist: bool = False) -> str:
     path = Path(raw_path)
     resolved = (REPO / path).resolve() if not path.is_absolute() else path.resolve()
@@ -83,9 +120,8 @@ def validate_repo_path(raw_path: str, *, must_exist: bool = False) -> str:
     except ValueError as exc:
         raise ValueError(f"path escapes repository root: {raw_path}") from exc
 
-    parts = set(rel.parts)
-    lowered = str(rel).lower()
-    if parts & SENSITIVE_NAMES or any(word in lowered for word in SENSITIVE_WORDS):
+    findings = path_policy_findings(rel)
+    if not findings["allowed"]:
         raise ValueError(f"refusing sensitive path: {raw_path}")
     if must_exist and not resolved.exists():
         raise ValueError(f"path does not exist: {raw_path}")
@@ -93,10 +129,7 @@ def validate_repo_path(raw_path: str, *, must_exist: bool = False) -> str:
 
 
 def is_sensitive_rel(path: Path | str) -> bool:
-    rel = Path(path)
-    parts = set(rel.parts)
-    lowered = str(rel).lower()
-    return bool(parts & SENSITIVE_NAMES or any(word in lowered for word in SENSITIVE_WORDS))
+    return not path_policy_findings(Path(path))["allowed"]
 
 
 def repo_host_path_for(path: Path) -> Path:
@@ -192,6 +225,26 @@ def append_harness_event(root: Path, event: dict[str, Any]) -> None:
     event.setdefault("timestamp_ms", now_ms())
     events.append(event)
     write_json(manifest, payload)
+
+
+def reserve_attempt(root: Path, label: str | None = None) -> tuple[int, str]:
+    manifest = root / "manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
+    key = label or "attempt"
+    counters = payload.setdefault("attempt_counters", {})
+    number = int(counters.get(key, 0)) + 1
+    counters[key] = number
+    write_json(manifest, payload)
+    return number, f"{key}-{number:03d}"
+
+
+def attempt_path(root: Path, directory: str, source_rel: Path, attempt_id: str) -> Path:
+    suffix = "".join(source_rel.suffixes)
+    stem = source_rel.name[: -len(suffix)] if suffix else source_rel.name
+    if not stem:
+        stem = "artifact"
+    target_name = f"{stem}.{attempt_id}{suffix}"
+    return root / directory / target_name
 
 
 def docker_client() -> docker.DockerClient:
@@ -309,8 +362,8 @@ def deepseek_file_prompt(task: str, included_paths: list[str], file_context: str
 
 硬性规则：
 - 只能基于下方提供的文件内容回答；不要假设你读取了仓库其他文件。
-- 不要要求读取 .env、.key、.git、node_modules、test-results、token、secret、credential 或私钥相关文件。
-- 不要输出 API key、token、私钥或凭据值。
+- 不要要求读取 .env、.key、.git、node_modules、test-results、secret、credential 或私钥相关文件。
+- 不要输出 API key、访问令牌、私钥或凭据值。
 - 不要声称你执行了命令、安装依赖、修改文件或提交代码。
 - 如果信息不足，明确说明缺口，不要扩大范围。
 
@@ -377,6 +430,54 @@ def extract_diff_block(text: str) -> str | None:
     return None
 
 
+def extract_fenced_code(text: str, language: str) -> tuple[str | None, list[dict[str, Any]]]:
+    blocks: list[dict[str, Any]] = []
+    pattern = re.compile(r"```([A-Za-z0-9_+.-]*)\s*\n(.*?)```", flags=re.DOTALL)
+    wanted = language.lower().strip()
+    aliases = {wanted}
+    if wanted == "python":
+        aliases.add("py")
+    for match in pattern.finditer(text):
+        label = (match.group(1) or "").strip().lower()
+        code = match.group(2).strip() + "\n"
+        blocks.append({"language": label, "code": code, "bytes": len(code.encode("utf-8"))})
+    matching = [block for block in blocks if block["language"] in aliases]
+    if len(matching) == 1:
+        return matching[0]["code"], blocks
+    if not matching and len(blocks) == 1 and wanted in ("text", "markdown"):
+        return blocks[0]["code"], blocks
+    return None, blocks
+
+
+def deepseek_generate_file_prompt(
+    task: str,
+    included_paths: list[str],
+    file_context: str,
+    *,
+    language: str,
+) -> str:
+    allowed = "\n".join(f"- {path}" for path in included_paths)
+    return f"""你是 DeepSeek，正在 Codex MCP 监督型 harness 中生成一个 artifact 文件。
+
+允许使用的文件内容：
+{allowed}
+
+硬性规则：
+- 只能基于下方提供的文件内容和任务要求生成文件；不要假设你读取了其他文件。
+- 不要要求读取 .env、.key、.git、node_modules、test-results、secret、credential 或私钥相关文件。
+- 不要输出真实 API key、凭据、私钥或 secret 值。
+- 不要声称你已经修改了仓库文件；你只是在输出候选 artifact 内容。
+- 输出必须且只能包含一个 ```{language} fenced code block。
+- code block 外不要写解释、摘要、清单或后续建议。
+
+任务：
+{task}
+
+文件内容：
+{file_context}
+"""
+
+
 def run_deepseek_file_workflow(
     *,
     task: str,
@@ -421,8 +522,8 @@ def run_deepseek_file_workflow(
 def copy_ignore(directory: str, names: list[str]) -> set[str]:
     ignored: set[str] = set()
     for name in names:
-        lowered = name.lower()
-        if name in SENSITIVE_NAMES or any(word in lowered for word in SENSITIVE_WORDS):
+        findings = path_policy_findings(Path(name))
+        if not findings["allowed"]:
             ignored.add(name)
         elif name in {"artifacts", "node_modules", "test-results", "__pycache__"}:
             ignored.add(name)
@@ -548,26 +649,51 @@ def harness_policy_check(
     artifact_paths: list[str] | None = None,
     image: str | None = None,
     test_template: str | None = None,
+    policy_profile: str = "strict-secrets",
 ) -> dict[str, Any]:
     """Check harness inputs against path, image, and command-template policy."""
+    policy_profile = validate_policy_profile(policy_profile)
     checks: list[dict[str, Any]] = []
     allowed = True
 
     for raw_path in repo_paths or []:
         try:
             validate_repo_path(raw_path, must_exist=False)
-            checks.append({"kind": "repo_path", "value": raw_path, "allowed": True})
+            rel = Path(validate_repo_path(raw_path, must_exist=False))
+            findings = path_policy_findings(rel, policy_profile=policy_profile)
+            if not findings["allowed"]:
+                allowed = False
+            checks.append({"kind": "repo_path", "value": raw_path, **findings})
         except Exception as exc:
             allowed = False
-            checks.append({"kind": "repo_path", "value": raw_path, "allowed": False, "reason": str(exc)})
+            checks.append(
+                {
+                    "kind": "repo_path",
+                    "value": raw_path,
+                    "allowed": False,
+                    "policy_profile": policy_profile,
+                    "reason": str(exc),
+                }
+            )
 
     for raw_path in artifact_paths or []:
         try:
-            validate_workspace_rel_path(raw_path, must_exist=False)
-            checks.append({"kind": "artifact_path", "value": raw_path, "allowed": True})
+            rel = validate_workspace_rel_path(raw_path, must_exist=False)
+            findings = path_policy_findings(rel, policy_profile=policy_profile)
+            if not findings["allowed"]:
+                allowed = False
+            checks.append({"kind": "artifact_path", "value": raw_path, **findings})
         except Exception as exc:
             allowed = False
-            checks.append({"kind": "artifact_path", "value": raw_path, "allowed": False, "reason": str(exc)})
+            checks.append(
+                {
+                    "kind": "artifact_path",
+                    "value": raw_path,
+                    "allowed": False,
+                    "policy_profile": policy_profile,
+                    "reason": str(exc),
+                }
+            )
 
     if image is not None:
         try:
@@ -598,6 +724,7 @@ def harness_policy_check(
             {
                 "type": "policy_check",
                 "status": "ok" if allowed else "failed",
+                "policy_profile": policy_profile,
                 "allowed": allowed,
                 "checks": checks,
             },
@@ -606,8 +733,10 @@ def harness_policy_check(
     return {
         "returncode": 0 if allowed else 2,
         "allowed": allowed,
+        "policy_profile": policy_profile,
         "checks": checks,
         "allowed_test_templates": sorted(ALLOWED_TEST_TEMPLATES),
+        "policy_profiles": list(POLICY_PROFILES),
     }
 
 
@@ -642,12 +771,120 @@ def harness_write_file(run_id: str, relative_path: str, content: str) -> dict[st
 
 
 @mcp.tool()
+def deepseek_generate_artifact_file(
+    run_id: str,
+    task: str,
+    allow_paths: list[str],
+    output_path: str,
+    language: str = "python",
+    timeout: int = 600,
+    attempt_label: str | None = None,
+    max_output_tokens: int = 12000,
+) -> dict[str, Any]:
+    """Ask DeepSeek for one fenced code block and write it as a versioned harness artifact."""
+    run_id, root = ensure_harness_workspace(run_id)
+    language = language.lower().strip()
+    if not re.fullmatch(r"[A-Za-z0-9_+.-]{1,40}", language):
+        raise ValueError(f"invalid language label: {language}")
+    output_rel = validate_workspace_rel_path(output_path)
+    expected_suffix = LANGUAGE_EXTENSIONS.get(language)
+    if expected_suffix and Path(output_rel).suffix and Path(output_rel).suffix != expected_suffix:
+        raise ValueError(f"output_path for {language} should end with {expected_suffix}")
+    timeout = max(1, min(int(timeout), 1200))
+    max_output_tokens = max(1000, min(int(max_output_tokens), 30000))
+    attempt_number, attempt_id = reserve_attempt(root, attempt_label or Path(output_rel).stem)
+
+    included, file_context = collect_allowed_context(allow_paths)
+    prompt = deepseek_generate_file_prompt(task, included, file_context, language=language)
+    prompt_path = root / "inputs" / f"generate-{attempt_id}.prompt.md"
+    raw_output_path = root / "outputs" / f"generate-{attempt_id}.deepseek-output.md"
+    metadata_path = root / "reports" / f"generate-{attempt_id}.json"
+    prompt_path.write_text(prompt, encoding="utf-8")
+
+    output = call_responses_proxy(prompt, timeout=timeout, max_output_tokens=max_output_tokens)
+    raw_output_path.write_text(output, encoding="utf-8")
+    code, blocks = extract_fenced_code(output, language)
+    metadata: dict[str, Any] = {
+        "returncode": 0,
+        "run_id": run_id,
+        "attempt_number": attempt_number,
+        "attempt_id": attempt_id,
+        "language": language,
+        "output_path": output_path,
+        "included_paths": included,
+        "prompt_path": str(prompt_path),
+        "raw_output_path": str(raw_output_path),
+        "code_blocks": [{"language": block["language"], "bytes": block["bytes"]} for block in blocks],
+    }
+
+    if code is None:
+        metadata.update(
+            {
+                "returncode": 2,
+                "stderr": f"expected exactly one ```{language} fenced code block",
+                "extracted_path": None,
+                "latest_path": None,
+                "sha256": None,
+            }
+        )
+        write_json(metadata_path, metadata)
+        append_harness_event(
+            root,
+            {
+                "type": "generate_artifact_file",
+                "status": "failed",
+                "attempt_id": attempt_id,
+                "path": output_path,
+                "returncode": 2,
+            },
+        )
+        metadata["metadata_path"] = str(metadata_path)
+        return metadata
+
+    if len(code.encode("utf-8")) > MAX_HARNESS_FILE_BYTES:
+        raise ValueError(f"generated artifact is too large: max {MAX_HARNESS_FILE_BYTES} bytes")
+    latest_path = workspace_path(root, str(output_rel))
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    latest_path.write_text(code, encoding="utf-8")
+    versioned_path = attempt_path(root, latest_path.parent.relative_to(root).as_posix(), output_rel, attempt_id)
+    versioned_path.parent.mkdir(parents=True, exist_ok=True)
+    versioned_path.write_text(code, encoding="utf-8")
+    digest = sha256_text(code)
+    metadata.update(
+        {
+            "stderr": "",
+            "latest_path": str(latest_path),
+            "versioned_path": str(versioned_path),
+            "latest_relative_path": str(latest_path.relative_to(root)),
+            "versioned_relative_path": str(versioned_path.relative_to(root)),
+            "bytes": len(code.encode("utf-8")),
+            "sha256": digest,
+        }
+    )
+    write_json(metadata_path, metadata)
+    append_harness_event(
+        root,
+        {
+            "type": "generate_artifact_file",
+            "status": "ok",
+            "attempt_id": attempt_id,
+            "path": str(latest_path.relative_to(root)),
+            "versioned_path": str(versioned_path.relative_to(root)),
+            "sha256": digest,
+        },
+    )
+    metadata["metadata_path"] = str(metadata_path)
+    return metadata
+
+
+@mcp.tool()
 def harness_run_temp_script(
     run_id: str,
     image: str,
     script_path: str,
     timeout: int = 600,
     network_disabled: bool = True,
+    attempt_label: str | None = None,
 ) -> dict[str, Any]:
     """Run an artifact workspace Python script with repo read-only and artifacts read-write."""
     image = validate_image(image)
@@ -679,10 +916,105 @@ def harness_run_temp_script(
         "network_disabled": bool(network_disabled),
     }
     append_harness_event(root, event)
-    log_path = root / "logs" / f"{script.stem}.log"
+    if attempt_label:
+        attempt_id = validate_run_id(attempt_label, "attempt")
+        log_path = root / "logs" / f"{script.stem}.{attempt_id}.log"
+    else:
+        log_path = root / "logs" / f"{script.stem}.log"
     log_path.write_text(result.get("stdout", "") + result.get("stderr", ""), encoding="utf-8")
     result.update({"run_id": run_id, "log_path": str(log_path), "script_sha256": sha256_file(script)})
     return result
+
+
+@mcp.tool()
+def harness_static_assertions(
+    run_id: str,
+    code_path: str | None = None,
+    log_path: str | None = None,
+    stdout: str | None = None,
+    stderr: str | None = None,
+    required_stdout: list[str] | None = None,
+    required_stderr: list[str] | None = None,
+    required_code: list[str] | None = None,
+    forbidden_code: list[str] | None = None,
+    forbidden_stdout: list[str] | None = None,
+    expected_returncode: int | None = None,
+    actual_returncode: int | None = None,
+    max_duration_ms: int | None = None,
+    actual_duration_ms: int | None = None,
+    policy_profile: str = "ml-code",
+    attempt_label: str | None = None,
+) -> dict[str, Any]:
+    """Run structured assertions over generated code, logs, stdout, and return metadata."""
+    run_id, root = ensure_harness_workspace(run_id)
+    policy_profile = validate_policy_profile(policy_profile)
+    checks: list[dict[str, Any]] = []
+
+    code_text = ""
+    log_text = ""
+    if code_path:
+        code_file = workspace_path(root, code_path, must_exist=True)
+        code_text = read_text_snippet(code_file, MAX_HARNESS_FILE_BYTES)
+    if log_path:
+        log_file = workspace_path(root, log_path, must_exist=True)
+        log_text = read_text_snippet(log_file, MAX_HARNESS_FILE_BYTES)
+    combined_stdout = (stdout or "") + ("\n" + log_text if log_text else "")
+    combined_stderr = stderr or ""
+
+    def add_check(kind: str, value: Any, passed: bool, detail: str = "") -> None:
+        checks.append({"kind": kind, "value": value, "passed": passed, "detail": detail})
+
+    for marker in required_stdout or []:
+        add_check("required_stdout", marker, marker in combined_stdout)
+    for marker in required_stderr or []:
+        add_check("required_stderr", marker, marker in combined_stderr)
+    for marker in required_code or []:
+        add_check("required_code", marker, marker in code_text)
+    for marker in forbidden_code or []:
+        add_check("forbidden_code", marker, marker not in code_text)
+    for marker in forbidden_stdout or []:
+        add_check("forbidden_stdout", marker, marker not in combined_stdout)
+    if expected_returncode is not None:
+        add_check("expected_returncode", expected_returncode, actual_returncode == expected_returncode, f"actual={actual_returncode}")
+    if max_duration_ms is not None and actual_duration_ms is not None:
+        add_check("max_duration_ms", max_duration_ms, actual_duration_ms <= max_duration_ms, f"actual={actual_duration_ms}")
+
+    hard_secret_patterns = [
+        r"sk-[A-Za-z0-9_-]{20,}",
+        r"(?i)api[_-]?key\s*=\s*['\"][^'\"]{12,}",
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    ]
+    if policy_profile in {"strict-secrets", "web-app", "ml-code"}:
+        for pattern in hard_secret_patterns:
+            found = re.search(pattern, code_text) is not None
+            add_check("hard_secret_pattern", pattern, not found)
+
+    passed = all(check["passed"] for check in checks)
+    attempt_id = validate_run_id(attempt_label, "assertions") if attempt_label else f"assertions-{now_ms()}"
+    report = {
+        "returncode": 0 if passed else 2,
+        "run_id": run_id,
+        "attempt_id": attempt_id,
+        "policy_profile": policy_profile,
+        "passed": passed,
+        "checks": checks,
+        "code_path": code_path,
+        "log_path": log_path,
+    }
+    report_path = root / "reports" / f"{attempt_id}.assertions.json"
+    write_json(report_path, report)
+    append_harness_event(
+        root,
+        {
+            "type": "static_assertions",
+            "status": "ok" if passed else "failed",
+            "attempt_id": attempt_id,
+            "returncode": report["returncode"],
+            "path": str(report_path.relative_to(root)),
+        },
+    )
+    report["report_path"] = str(report_path)
+    return report
 
 
 @mcp.tool()

@@ -39,7 +39,7 @@ Recommended config for the full Codex-driver/DeepSeek-worker harness:
 
 ```toml
 [mcp_servers.deepseek-driver]
-enabled_tools = ["docker_list_images", "docker_probe_torch", "docker_run_python_script", "harness_create_workspace", "harness_policy_check", "harness_write_file", "harness_run_temp_script", "harness_create_worktree", "harness_apply_patch", "harness_run_repo_tests", "harness_feedback_to_deepseek", "harness_collect_report", "deepseek_scan", "deepseek_patch"]
+enabled_tools = ["docker_list_images", "docker_probe_torch", "docker_run_python_script", "harness_create_workspace", "harness_policy_check", "harness_write_file", "deepseek_generate_artifact_file", "harness_run_temp_script", "harness_static_assertions", "harness_create_worktree", "harness_apply_patch", "harness_run_repo_tests", "harness_feedback_to_deepseek", "harness_collect_report", "deepseek_scan", "deepseek_patch"]
 startup_timeout_sec = 60
 tool_timeout_sec = 600
 ```
@@ -50,9 +50,11 @@ tool_timeout_sec = 600
 - `docker_probe_torch(image, timeout=120)`: runs `import torch; print(torch.__version__)` in a selected image.
 - `docker_run_python_script(image, script_path, timeout=600)`: runs one repository Python script by mounting that script's directory read-only.
 - `harness_create_workspace(run_id)`: creates `artifacts/deepseek/harness/<run-id>/` with `inputs/`, `scripts/`, `outputs/`, `logs/`, `reports/`, `patches/`, and `worktrees/`.
-- `harness_policy_check(run_id, repo_paths, artifact_paths, image, test_template)`: checks paths, image names, and test templates against the harness policy.
+- `harness_policy_check(run_id, repo_paths, artifact_paths, image, test_template, policy_profile)`: checks paths, image names, and test templates against the harness policy.
 - `harness_write_file(run_id, relative_path, content)`: writes only inside the harness artifact workspace and records bytes plus sha256.
-- `harness_run_temp_script(run_id, image, script_path, timeout, network_disabled=True)`: runs an artifact Python script in Docker with `/repo` read-only and `/artifact` read-write.
+- `deepseek_generate_artifact_file(run_id, task, allow_paths, output_path, language, timeout, attempt_label)`: calls DeepSeek, requires exactly one fenced code block, writes the latest artifact, and stores a versioned attempt copy plus extraction metadata.
+- `harness_run_temp_script(run_id, image, script_path, timeout, network_disabled=True, attempt_label=None)`: runs an artifact Python script in Docker with `/repo` read-only and `/artifact` read-write. When `attempt_label` is set, the log path is versioned.
+- `harness_static_assertions(run_id, ...)`: checks generated code, stdout/stderr, return code, runtime, required markers, and task-specific forbidden strings. The default `ml-code` profile does not treat `token` as forbidden code.
 - `harness_create_worktree(run_id, base_ref="working-copy")`: creates a sanitized isolated repository copy under the harness workspace.
 - `harness_apply_patch(run_id, patch_path, timeout=120)`: runs `git apply --check` and applies the patch only inside the isolated worktree.
 - `harness_run_repo_tests(run_id, image, test_template, timeout=600, network_disabled=True)`: runs only an allow-listed template: `pytest`, `python -m pytest`, or `npm test`.
@@ -71,12 +73,13 @@ The server rejects paths outside `/repo` and rejects sensitive names or substrin
 - `node_modules`
 - `test-results`
 - `secret`
-- `token`
 - `credential`
 - `private_key`
 - `api_key`
 
-DeepSeek scan/patch does not receive a shell, does not scan the repository, and does not read files beyond `allow_paths`. It sees only the file contents that the MCP server embeds in the prompt.
+`token`, `auth`, `password`, and `session` are soft policy signals by default. They are reported by `harness_policy_check` but are not automatically rejected in generated code, because ML/NLP tasks commonly use words such as `token` and `tokenizer`.
+
+DeepSeek scan/patch/generate does not receive a shell, does not scan the repository, and does not read files beyond `allow_paths`. It sees only the file contents that the MCP server embeds in the prompt.
 
 Harness tools keep writes away from the real repository:
 
@@ -98,10 +101,14 @@ Run these before claiming the MCP driver is usable:
 5. `deepseek_scan` with `.env` fails with a sensitive-path rejection.
 6. `deepseek_patch` writes `deepseek-output.md` and, when DeepSeek emits a diff block, `patch.diff`.
 7. `harness_policy_check` rejects `.env`, `.key`, `.git`, and `../` paths.
-8. `harness_run_temp_script` can run a temporary artifact Python script and write to `outputs/`.
-9. `harness_apply_patch` applies a patch to the isolated worktree and leaves the real repository untouched.
-10. `harness_run_repo_tests` runs an allow-listed template in Docker and logs stdout/stderr.
-11. `harness_feedback_to_deepseek` can turn a bounded failure log plus allow-listed files into a revised patch draft.
+8. `harness_policy_check(policy_profile="ml-code")` allows `scripts/tokenizer.py` while reporting a soft `token` hit.
+9. `deepseek_generate_artifact_file` writes both a latest file and a versioned attempt copy.
+10. `harness_run_temp_script(attempt_label=...)` writes a versioned log.
+11. `harness_static_assertions` passes with default `ml-code` when generated code contains `token`, and fails when `forbidden_code=["token"]` is explicitly requested.
+12. `harness_run_temp_script` can run a temporary artifact Python script and write to `outputs/`.
+13. `harness_apply_patch` applies a patch to the isolated worktree and leaves the real repository untouched.
+14. `harness_run_repo_tests` runs an allow-listed template in Docker and logs stdout/stderr.
+15. `harness_feedback_to_deepseek` can turn a bounded failure log plus allow-listed files into a revised patch draft.
 
 ## Harness Levels
 
@@ -109,7 +116,7 @@ Run these before claiming the MCP driver is usable:
 - Level 1, read-only DeepSeek analysis: `deepseek_scan`.
 - Level 2, bounded script execution: `docker_run_python_script` for existing scripts, `harness_run_temp_script` for artifact scripts.
 - Level 3, patch draft: `deepseek_patch`.
-- Level 4, dynamic experiment harness: `harness_create_workspace`, `harness_write_file`, `harness_run_temp_script`, `harness_collect_report`.
+- Level 4, dynamic experiment harness: `harness_create_workspace`, `deepseek_generate_artifact_file`, `harness_write_file`, `harness_run_temp_script`, `harness_static_assertions`, `harness_collect_report`.
 - Level 5, reviewable repair loop: `harness_create_worktree`, `harness_apply_patch`, `harness_run_repo_tests`, `harness_feedback_to_deepseek`, final Codex review.
 
 The intended operating model is:

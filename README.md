@@ -62,7 +62,9 @@ The MCP driver does not expose arbitrary shell access. Its DeepSeek tools read o
 For the Codex-driver/DeepSeek-worker flow, the MCP server also supports:
 
 - artifact workspaces under `artifacts/deepseek/harness/<run-id>/`
+- DeepSeek file generation with fenced-code extraction and versioned attempt copies
 - temporary script execution in Docker with the repo mounted read-only
+- structured static assertions for stdout markers, return codes, code snippets, and task-specific forbidden strings
 - isolated sanitized repository copies for patch checking
 - allow-listed test templates such as `python -m pytest`
 - bounded failure feedback to DeepSeek for revised patch drafts
@@ -85,6 +87,8 @@ Validated locally against:
 - Dockerized MCP protocol self-test with `tools/list`, PyTorch image probe, sensitive path rejection, `deepseek_scan`, and `deepseek_patch`
 - LV4 harness smoke test: write an artifact Python script, run it in `cat-psych:cpu`, and write output under `artifacts/`
 - LV5 harness smoke test: create an isolated worktree, apply a patch there, run `python -m pytest`, collect a report, and feed a bounded failure summary back to DeepSeek
+- policy split smoke test: `tokenizer.py` is allowed with a soft `token` warning, while `.env` and `.key` remain hard rejections
+- generated artifact smoke test: `deepseek_generate_artifact_file` extracts one Python code block, writes `latest` plus an attempt copy, runs it in Docker, and validates it with `harness_static_assertions`
 
 Known Codex CLI boundary:
 
