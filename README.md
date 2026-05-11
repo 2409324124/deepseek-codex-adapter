@@ -15,6 +15,9 @@ This project provides a local adapter that:
 - disables DeepSeek thinking mode to avoid unsupported `reasoning_content` round-trips during tool use
 - includes bounded smoke tests for real Codex agent workflows
 - packages a narrow MCP driver for Docker image probes, allow-listed DeepSeek scan/patch artifacts, dynamic experiment harnesses, and isolated patch/test loops
+- separates MCP scan, plan, and patch paths: `deepseek_plan` is plan-only and rejects diff-shaped output at the server layer, while `deepseek_patch` supports `mode="plan"` and `mode="diff"` with artifact redaction and mechanical patch validation before harness use
+
+中文摘要：MCP driver 现在区分 scan / plan / patch。`deepseek_plan` 是 plan-only，服务端拒绝 diff；`deepseek_patch` 支持 plan/diff mode，输出落盘前会做 redaction，diff 必须先通过机械校验。
 
 ## How It Works
 
@@ -57,7 +60,14 @@ This repository includes both layers:
 - `deepseek_responses_proxy.py`: makes DeepSeek usable behind Codex's Responses-style provider path.
 - `deepseek_driver_mcp.py`: lets an OpenAI/Codex driver call DeepSeek through whitelist tools and saved artifacts.
 
-The MCP driver does not expose arbitrary shell access. Its DeepSeek tools read only allow-listed non-sensitive files, call the local Responses proxy directly, and save `prompt.md`, `deepseek-output.md`, and optional `patch.diff` under `artifacts/deepseek/<run-id>/`.
+The MCP driver does not expose arbitrary shell access. Its DeepSeek tools read only allow-listed non-sensitive files and call the local Responses proxy directly. DeepSeek output is redacted before artifact persistence under `artifacts/deepseek/<run-id>/`.
+
+Plan and patch outputs are separated:
+
+- plan-mode output that contains unified diff markers is rejected with `PLAN_CONTAINS_DIFF` and does not write `patch.diff`
+- diff-mode output must pass `validate_patch_diff`, including sensitive-path checks and `git apply --check`, before `patch.diff` is saved
+- invalid patches are marked rejected and are not passed to `harness_apply_patch`
+- `harness_apply_patch` validates raw patch input before applying it to an isolated worktree
 
 For the Codex-driver/DeepSeek-worker flow, the MCP server also supports:
 
@@ -89,6 +99,11 @@ Validated locally against:
 - LV5 harness smoke test: create an isolated worktree, apply a patch there, run `python -m pytest`, collect a report, and feed a bounded failure summary back to DeepSeek
 - policy split smoke test: `tokenizer.py` is allowed with a soft `token` warning, while `.env` and `.key` remain hard rejections
 - generated artifact smoke test: `deepseek_generate_artifact_file` extracts one Python code block, writes `latest` plus an attempt copy, runs it in Docker, and validates it with `harness_static_assertions`
+- MCP output validation tests: plan diff-marker rejection, secret-like redaction, corrupt patch rejection, forbidden-path rejection, and `needs_host_access` non-escalation
+- Dockerized MCP `tools/list` validation showing `deepseek_scan`, `deepseek_plan`, `deepseek_patch`, and `harness_apply_patch`
+- E2E DeepSeek MCP validation through the local Responses proxy: `deepseek_plan` accepted a normal plan and did not write `patch.diff`; `deepseek_patch` produced a corrupt patch and was rejected with `PATCH_APPLY_CHECK_FAILED`; no patch was applied automatically
+
+`PLAN_CONTAINS_DIFF` is covered by local tests. The E2E run covered the normal plan path and the patch-validation rejection path.
 
 Known Codex CLI boundary:
 
@@ -134,10 +149,14 @@ deepseek-codex-adapter/
     ├── protocol-notes.md
     ├── mechanism-and-comparison.md
     └── github-publish-checklist.md
+tests/
+└── test_mcp_output_validation.py
 ```
 
 ## Safety
 
 Do not commit `.env`, `.key`, API keys, private keys, local systemd unit files with private paths, or project-specific wrapper scripts.
+
+MCP patch validation is a mechanical gate, not a semantic security review. It checks format, secret-like content, forbidden paths, dangerous host-access patterns, and `git apply --check`. Codex driver or the user must still review any patch before applying or publishing it.
 
 Run the publish checklist in `deepseek-codex-adapter/references/github-publish-checklist.md` before pushing.

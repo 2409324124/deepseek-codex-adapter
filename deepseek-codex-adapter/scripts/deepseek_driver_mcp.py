@@ -21,6 +21,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from typing import Any
 import urllib.error
@@ -55,6 +56,45 @@ LANGUAGE_EXTENSIONS = {
     "markdown": ".md",
     "text": ".txt",
 }
+PLAN_DIFF_MARKERS = (
+    re.compile(r"^diff --git\b"),
+    re.compile(r"^Index:\s+"),
+    re.compile(r"^new file mode\s+"),
+    re.compile(r"^deleted file mode\s+"),
+    re.compile(r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@"),
+    re.compile(r"^\+\+\+\s+"),
+    re.compile(r"^---\s+"),
+)
+SECRET_REDACTIONS = (
+    (re.compile(r"sk-[A-Za-z0-9_-]{12,}"), "sk-[REDACTED]"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA[REDACTED]"),
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.DOTALL), "-----BEGIN [REDACTED] PRIVATE KEY-----"),
+    (re.compile(r"\b(DEEPSEEK_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN)\s*=\s*[^\s`'\"<>]+"), r"\1=[REDACTED]"),
+    (re.compile(r"\b(token|api_key)\s*=\s*[^\s`'\"<>]+", re.IGNORECASE), lambda match: f"{match.group(1)}=[REDACTED]"),
+)
+PATCH_FORBIDDEN_PATHS = (
+    ".env",
+    ".key",
+    ".git",
+    "__pycache__",
+    "artifacts",
+    "security_review.md",
+)
+PATCH_FORBIDDEN_WORDS = (
+    "secret",
+    "credential",
+    "private_key",
+    "api_key",
+)
+PATCH_DANGEROUS_PATTERNS = (
+    re.compile(r"\bneeds_host_access\b.*\b(privileged|cap_add|network_mode|volumes|mounts)\b", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\b(privileged|cap_add|network_mode|volumes|mounts)\b.*\bneeds_host_access\b", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\bprivileged\s*=\s*True\b"),
+    re.compile(r"\bcap_add\b"),
+    re.compile(r"\bnetwork_mode\s*=\s*['\"]host['\"]"),
+    re.compile(r"['\"]/:/"),
+    re.compile(r"/var/run/docker\.sock"),
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -350,13 +390,170 @@ def run_container(
             pass
 
 
-def deepseek_file_prompt(task: str, included_paths: list[str], file_context: str, *, patch: bool) -> str:
-    allowed = "\n".join(f"- {path}" for path in included_paths)
-    mode_rules = (
-        "必须输出一个 unified diff 补丁草案，放在唯一一个 ```diff 代码块中。不要声称已经修改文件。"
-        if patch
-        else "用中文输出结构化扫描报告。"
+def redact_secret_like_text(text: str) -> tuple[str, bool]:
+    redacted = text
+    changed = False
+    for pattern, replacement in SECRET_REDACTIONS:
+        redacted, count = pattern.subn(replacement, redacted)
+        changed = changed or count > 0
+    return redacted, changed
+
+
+def plan_diff_markers(text: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        for pattern in PLAN_DIFF_MARKERS:
+            if pattern.search(stripped):
+                findings.append({"line": lineno, "marker": stripped[:160]})
+                break
+    return findings
+
+
+def validate_plan_output(text: str) -> dict[str, Any]:
+    markers = plan_diff_markers(text)
+    if markers:
+        return {
+            "ok": False,
+            "error_code": "PLAN_CONTAINS_DIFF",
+            "message": "Model output included unified diff markers in plan-only mode.",
+            "markers": markers,
+        }
+    return {"ok": True, "error_code": None, "message": "plan output passed validation", "markers": []}
+
+
+def patch_paths(diff: str) -> list[str]:
+    paths: list[str] = []
+    patterns = (
+        re.compile(r"^diff --git a/(.*?) b/(.*?)$"),
+        re.compile(r"^(?:---|\+\+\+) (?:a|b)/(.*?)$"),
     )
+    for line in diff.splitlines():
+        for pattern in patterns:
+            match = pattern.match(line)
+            if not match:
+                continue
+            values = match.groups()
+            for value in values:
+                if value != "/dev/null":
+                    paths.append(value)
+            break
+    return sorted(set(paths))
+
+
+def patch_forbidden_path_hits(paths: list[str]) -> list[str]:
+    hits: list[str] = []
+    for raw_path in paths:
+        lowered = raw_path.lower()
+        path = Path(raw_path)
+        parts = set(path.parts)
+        if parts & set(PATCH_FORBIDDEN_PATHS):
+            hits.append(raw_path)
+            continue
+        if any(lowered.endswith(suffix) for suffix in (".key", ".pem", ".p12", ".pfx", ".pyc")):
+            hits.append(raw_path)
+            continue
+        if any(word in lowered for word in PATCH_FORBIDDEN_WORDS):
+            hits.append(raw_path)
+    return sorted(set(hits))
+
+
+def patch_dangerous_hits(diff: str) -> list[str]:
+    hits: list[str] = []
+    for pattern in PATCH_DANGEROUS_PATTERNS:
+        match = pattern.search(diff)
+        if match:
+            hits.append(match.group(0)[:160])
+    return hits
+
+
+def validate_patch_diff(diff: str, *, cwd: Path | None = None, timeout: int = 120) -> dict[str, Any]:
+    if not diff.strip() or "diff --git " not in diff:
+        return {
+            "ok": False,
+            "error_code": "PATCH_INVALID_FORMAT",
+            "message": "Patch is not a unified git diff.",
+            "validated_patch_id": None,
+        }
+
+    redacted_diff, redacted = redact_secret_like_text(diff)
+    if redacted:
+        return {
+            "ok": False,
+            "error_code": "PATCH_CONTAINS_SECRET_LIKE_TEXT",
+            "message": "Patch contains secret-like text and was rejected.",
+            "validated_patch_id": None,
+            "redacted": True,
+        }
+
+    paths = patch_paths(redacted_diff)
+    forbidden_paths = patch_forbidden_path_hits(paths)
+    if forbidden_paths:
+        return {
+            "ok": False,
+            "error_code": "PATCH_TOUCHES_FORBIDDEN_PATH",
+            "message": "Patch touches forbidden paths.",
+            "validated_patch_id": None,
+            "paths": forbidden_paths,
+        }
+
+    dangerous = patch_dangerous_hits(redacted_diff)
+    if dangerous:
+        return {
+            "ok": False,
+            "error_code": "PATCH_CONTAINS_DANGEROUS_HOST_ACCESS",
+            "message": "Patch appears to add dangerous host access or permission logic.",
+            "validated_patch_id": None,
+            "hits": dangerous,
+        }
+
+    check_cwd = cwd or REPO
+    with tempfile.TemporaryDirectory(prefix="deepseek-patch-check-") as temp_dir:
+        temp_patch = Path(temp_dir) / "candidate.diff"
+        temp_patch.write_text(redacted_diff, encoding="utf-8")
+        check = run_local_command(
+            ["git", "apply", "--check", str(temp_patch)],
+            cwd=check_cwd,
+            timeout=max(1, min(int(timeout), 600)),
+        )
+    if check["returncode"] != 0:
+        return {
+            "ok": False,
+            "error_code": "PATCH_APPLY_CHECK_FAILED",
+            "message": f"git apply --check failed: {check.get('stderr') or check.get('stdout')}",
+            "validated_patch_id": None,
+            "check": check,
+        }
+    return {
+        "ok": True,
+        "error_code": None,
+        "message": "patch passed validation",
+        "validated_patch_id": hashlib.sha256(redacted_diff.encode("utf-8")).hexdigest()[:24],
+        "paths": paths,
+        "check": check,
+    }
+
+
+def write_workflow_metadata(artifact_dir: Path, payload: dict[str, Any]) -> Path:
+    metadata_path = artifact_dir / "metadata.json"
+    write_json(metadata_path, payload)
+    return metadata_path
+
+
+def deepseek_file_prompt(
+    task: str,
+    included_paths: list[str],
+    file_context: str,
+    *,
+    mode: str,
+) -> str:
+    allowed = "\n".join(f"- {path}" for path in included_paths)
+    if mode == "diff":
+        mode_rules = "必须输出一个 unified diff 补丁草案，放在唯一一个 ```diff 代码块中。不要声称已经修改文件。"
+    elif mode == "plan":
+        mode_rules = "只输出补丁计划，不要输出 unified diff，不要输出 ```diff 代码块，不要包含 diff marker。"
+    else:
+        mode_rules = "用中文输出结构化扫描报告。"
     return f"""你是 DeepSeek，正在 Codex MCP 驾驶工作流中执行受限文件分析。
 
 允许使用的文件内容：
@@ -486,38 +683,114 @@ def run_deepseek_file_workflow(
     allow_paths: list[str],
     run_id: str | None,
     timeout: int,
-    patch: bool,
+    mode: str,
 ) -> dict[str, Any]:
-    run_id = validate_run_id(run_id, "mcp-deepseek-patch" if patch else "mcp-deepseek-scan")
+    if mode not in {"scan", "plan", "diff"}:
+        raise ValueError("mode must be one of: scan, plan, diff")
+    run_id = validate_run_id(run_id, f"mcp-deepseek-{mode}")
     timeout = max(1, min(int(timeout), 1200))
     included, file_context = collect_allowed_context(allow_paths)
     artifact_dir = REPO / "artifacts" / "deepseek" / run_id
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    prompt = deepseek_file_prompt(task, included, file_context, patch=patch)
+    prompt = deepseek_file_prompt(task, included, file_context, mode=mode)
     prompt_path = artifact_dir / "prompt.md"
     output_path = artifact_dir / "deepseek-output.md"
     prompt_path.write_text(prompt, encoding="utf-8")
-    output = call_responses_proxy(prompt, timeout=timeout)
+    raw_output = call_responses_proxy(prompt, timeout=timeout)
+    output, redacted = redact_secret_like_text(raw_output)
     output_path.write_text(output, encoding="utf-8")
+    status = "quarantine" if redacted else "accepted"
+    error_code = None
+    validation: dict[str, Any] | None = None
 
     result: dict[str, Any] = {
         "returncode": 0,
         "stdout": output[-12000:],
         "stderr": "",
+        "mode": mode,
+        "artifact_status": status,
+        "redacted": redacted,
+        "error_code": error_code,
         "artifact_dir": str(artifact_dir),
         "prompt_path": str(prompt_path),
         "output_path": str(output_path),
         "included_paths": included,
     }
-    if patch:
-        diff = extract_diff_block(output)
-        if diff:
-            patch_path = artifact_dir / "patch.diff"
-            patch_path.write_text(diff, encoding="utf-8")
-            result["patch_path"] = str(patch_path)
+
+    if mode == "plan":
+        validation = validate_plan_output(output)
+        if not validation["ok"]:
+            status = "quarantine" if redacted else "rejected"
+            error_code = validation["error_code"]
+            result.update(
+                {
+                    "returncode": 2,
+                    "stderr": validation["message"],
+                    "artifact_status": status,
+                    "error_code": error_code,
+                    "validation": validation,
+                    "patch_path": None,
+                }
+            )
         else:
+            result["validation"] = validation
             result["patch_path"] = None
-            result["stderr"] = "no ```diff code block found in DeepSeek output"
+    elif mode == "diff":
+        diff = extract_diff_block(output)
+        if not diff:
+            status = "quarantine" if redacted else "rejected"
+            error_code = "PATCH_MISSING_DIFF"
+            validation = {
+                "ok": False,
+                "error_code": error_code,
+                "message": "no ```diff code block found in DeepSeek output",
+                "validated_patch_id": None,
+            }
+            result.update(
+                {
+                    "returncode": 2,
+                    "stderr": validation["message"],
+                    "artifact_status": status,
+                    "error_code": error_code,
+                    "validation": validation,
+                    "patch_path": None,
+                }
+            )
+        else:
+            validation = validate_patch_diff(diff, cwd=REPO, timeout=timeout)
+            if validation["ok"] and not redacted:
+                patch_path = artifact_dir / "patch.diff"
+                patch_path.write_text(diff, encoding="utf-8")
+                result.update(
+                    {
+                        "patch_path": str(patch_path),
+                        "validated_patch_id": validation["validated_patch_id"],
+                        "validation": validation,
+                    }
+                )
+            else:
+                status = "quarantine" if redacted else "rejected"
+                error_code = validation["error_code"]
+                result.update(
+                    {
+                        "returncode": 2,
+                        "stderr": validation["message"],
+                        "artifact_status": status,
+                        "error_code": error_code,
+                        "validation": validation,
+                        "patch_path": None,
+                    }
+                )
+    metadata = {
+        "run_id": run_id,
+        "mode": mode,
+        "artifact_status": result["artifact_status"],
+        "redacted": result["redacted"],
+        "error_code": result.get("error_code"),
+        "validation": result.get("validation"),
+        "included_paths": included,
+    }
+    result["metadata_path"] = str(write_workflow_metadata(artifact_dir, metadata))
     return result
 
 
@@ -1053,7 +1326,9 @@ def harness_apply_patch(run_id: str, patch_path: str, timeout: int = 120) -> dic
     """Apply an artifact patch to the isolated harness worktree, never to the real repo.
 
     Patch content safety remains the Codex driver's review responsibility; this
-    tool only guarantees path isolation and worktree-only application.
+    tool only validates basic patch policy, then guarantees path isolation and
+    worktree-only application. Docker daemon access remains a HIGH TRUST
+    boundary, and needs_host_access is not a permission switch.
     """
     run_id, root = ensure_harness_workspace(run_id)
     worktree = root / "worktrees" / "repo"
@@ -1063,6 +1338,26 @@ def harness_apply_patch(run_id: str, patch_path: str, timeout: int = 120) -> dic
     patch_abs = REPO / patch_rel
     if not patch_abs.name.endswith((".diff", ".patch")):
         raise ValueError("patch_path must end with .diff or .patch")
+    patch_text = patch_abs.read_text(encoding="utf-8", errors="replace")
+    validation = validate_patch_diff(patch_text, cwd=worktree, timeout=timeout)
+    if not validation["ok"]:
+        event = {
+            "type": "apply_patch",
+            "status": "rejected",
+            "path": str(patch_rel),
+            "returncode": 2,
+            "validation": validation,
+        }
+        append_harness_event(root, event)
+        return {
+            "returncode": 2,
+            "run_id": run_id,
+            "worktree_path": str(worktree),
+            "stored_patch": None,
+            "validation": validation,
+            "check": None,
+            "apply": None,
+        }
     stored_patch = root / "patches" / patch_abs.name
     if patch_abs.resolve() != stored_patch.resolve():
         shutil.copy2(patch_abs, stored_patch)
@@ -1076,6 +1371,7 @@ def harness_apply_patch(run_id: str, patch_path: str, timeout: int = 120) -> dic
         "status": "ok" if applied and applied["returncode"] == 0 else "failed",
         "path": str(stored_patch.relative_to(root)),
         "returncode": check["returncode"] if not applied else applied["returncode"],
+        "validated_patch_id": validation.get("validated_patch_id"),
     }
     append_harness_event(root, event)
     return {
@@ -1083,6 +1379,8 @@ def harness_apply_patch(run_id: str, patch_path: str, timeout: int = 120) -> dic
         "run_id": run_id,
         "worktree_path": str(worktree),
         "stored_patch": str(stored_patch),
+        "validated_patch_id": validation.get("validated_patch_id"),
+        "validation": validation,
         "check": check,
         "apply": applied,
     }
@@ -1217,7 +1515,29 @@ def deepseek_scan(
         allow_paths=allow_paths,
         run_id=run_id,
         timeout=timeout,
-        patch=False,
+        mode="scan",
+    )
+
+
+@mcp.tool()
+def deepseek_plan(
+    task: str,
+    allow_paths: list[str],
+    run_id: str | None = None,
+    timeout: int = 180,
+    needs_host_access: bool = False,
+) -> dict[str, Any]:
+    """Read only allow-listed files and ask DeepSeek for a plan-only artifact.
+
+    Plan output is rejected if it contains unified diff markers. needs_host_access
+    is reserved for future policy signaling and does not grant permissions.
+    """
+    return run_deepseek_file_workflow(
+        task=task,
+        allow_paths=allow_paths,
+        run_id=run_id,
+        timeout=timeout,
+        mode="plan",
     )
 
 
@@ -1228,18 +1548,23 @@ def deepseek_patch(
     run_id: str | None = None,
     timeout: int = 180,
     needs_host_access: bool = False,
+    mode: str = "diff",
 ) -> dict[str, Any]:
     """Read only allow-listed files, ask DeepSeek for a patch draft, and save artifacts.
 
     needs_host_access is reserved for future policy signaling and does not grant
-    additional permissions.
+    additional permissions. mode="plan" rejects diff markers and never writes
+    patch.diff; mode="diff" validates a patch before saving patch.diff.
     """
+    selected_mode = mode.lower().strip()
+    if selected_mode not in {"plan", "diff"}:
+        raise ValueError("mode must be 'plan' or 'diff'")
     return run_deepseek_file_workflow(
         task=task,
         allow_paths=allow_paths,
         run_id=run_id,
         timeout=timeout,
-        patch=True,
+        mode=selected_mode,
     )
 
 

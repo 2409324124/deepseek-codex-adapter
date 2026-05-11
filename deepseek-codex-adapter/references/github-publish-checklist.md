@@ -2,7 +2,7 @@
 
 ## Release Scope
 
-Publish only the skill folder contents:
+Publish only the skill package, public docs, and tests:
 
 ```text
 deepseek-codex-adapter/
@@ -16,12 +16,17 @@ deepseek-codex-adapter/
     ├── mcp-driver-workflow.md
     ├── mechanism-and-comparison.md
     └── github-publish-checklist.md
+tests/
+└── test_mcp_output_validation.py
 ```
 
 Do not publish:
 
 - `.env`
 - `.key`
+- `*.key`
+- `artifacts/`
+- `security_review.md`
 - tokens or private keys
 - local systemd unit files with user-specific paths
 - wrapper scripts containing private paths
@@ -35,18 +40,38 @@ Run from the skill folder or parent workspace:
 ```bash
 python3 -m py_compile scripts/deepseek_responses_proxy.py
 python3 -m py_compile scripts/deepseek_driver_mcp.py
+python3 -m pytest ../tests/test_mcp_output_validation.py -q
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
 docker build -t deepseek-driver-mcp:local -f docker/mcp-driver.Dockerfile .
+git diff --check
 find . -type f | sort
 ```
 
-Inspect for private paths:
+From the repository root, confirm no sensitive files are tracked:
+
+```bash
+git ls-files | grep -E '(^|/)(\.env|.*\.key|security_review\.md|artifacts/|.*private.*|.*secret.*|.*credential.*)' || true
+```
+
+The command should produce no output.
+
+Inspect for private paths and secret-shaped text:
 
 ```bash
 rg -n "[/]home[/]|[/]mnt[/]|DEE[P]SEEK_API_KEY=.*|gho[_]|sk[-]|BEGIN .*PRIV[A]TE|\\.env|\\.key" .
 ```
 
-Expected matches may include `.env` as a documented filename, but must not include real secrets or local project-specific absolute paths.
+Expected matches may include `.env` as a documented filename, placeholder API-key examples, and redaction regexes, but must not include real secrets or local project-specific absolute paths.
+
+Before pushing, also confirm:
+
+- `artifacts/` is not tracked.
+- `security_review.md` is not tracked.
+- `.env` and `*.key` are not tracked.
+- `__pycache__/` and `*.pyc` are absent.
+- README does not claim Docker or MCP is absolutely safe.
+- README does not claim DeepSeek patches can be automatically trusted.
+- README says Codex driver or user review is still required.
 
 ## Suggested Repository Shape
 
