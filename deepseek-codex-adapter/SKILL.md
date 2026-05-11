@@ -46,7 +46,7 @@ codex mcp add deepseek-driver -- \
 
 ```toml
 [mcp_servers.deepseek-driver]
-enabled_tools = ["docker_list_images", "docker_probe_torch", "docker_run_python_script", "harness_create_workspace", "harness_policy_check", "harness_write_file", "deepseek_generate_artifact_file", "harness_run_temp_script", "harness_static_assertions", "harness_create_worktree", "harness_apply_patch", "harness_run_repo_tests", "harness_feedback_to_deepseek", "harness_collect_report", "deepseek_scan", "deepseek_plan", "deepseek_patch"]
+enabled_tools = ["docker_list_images", "docker_probe_torch", "docker_run_python_script", "harness_create_workspace", "harness_policy_check", "harness_write_file", "deepseek_generate_artifact_file", "harness_run_temp_script", "harness_static_assertions", "harness_create_worktree", "harness_apply_patch", "harness_run_repo_tests", "harness_feedback_to_deepseek", "harness_collect_report", "deepseek_scan", "deepseek_plan", "deepseek_patch", "validate_patch"]
 startup_timeout_sec = 60
 tool_timeout_sec = 600
 ```
@@ -57,12 +57,13 @@ tool_timeout_sec = 600
    - `deepseek_scan` succeeds on an allow-listed non-sensitive file and writes `artifacts/deepseek/<run-id>/deepseek-output.md`.
    - `deepseek_plan` succeeds for plan-only requests and does not write `patch.diff`.
    - `deepseek_plan` rejects diff-shaped plan output with `PLAN_CONTAINS_DIFF`.
-   - `deepseek_patch(mode="diff")` validates patch output before writing accepted patch artifacts.
-   - corrupt or forbidden-path patches are rejected and must not enter `harness_apply_patch`.
+   - `deepseek_patch(mode="diff")` creates a candidate patch and returns `candidate_patch_id`.
+   - `validate_patch(candidate_patch_id=...)` returns `validated_patch_id` only after mechanical patch checks pass.
+   - corrupt, secret-like, forbidden-path, or dangerous host-access patches are rejected and must not enter `harness_apply_patch`.
    - `deepseek_generate_artifact_file` extracts exactly one fenced code block, writes a latest artifact, and preserves a versioned attempt copy.
    - `harness_run_temp_script` can run an artifact-only Python script with `/repo` read-only and `/artifact` writable; use `log_relative_path` with `harness_static_assertions(log_path=...)`.
    - `harness_static_assertions` validates return codes, stdout markers, code snippets, and task-specific forbidden strings.
-   - `harness_apply_patch` validates raw patch input, then applies only to an isolated harness worktree, never the real repository.
+   - `harness_apply_patch(validated_patch_id=...)` applies only to an isolated harness worktree, never the real repository. Deprecated `patch_path` input is validated before use.
    - `harness_run_repo_tests` runs only an allow-listed test template such as `python -m pytest`.
    - `.env`, `.key`, `.git`, secret, credential, and private-key paths are rejected; `token` is a soft policy signal, not a default generated-code violation.
 

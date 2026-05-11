@@ -15,9 +15,9 @@ This project provides a local adapter that:
 - disables DeepSeek thinking mode to avoid unsupported `reasoning_content` round-trips during tool use
 - includes bounded smoke tests for real Codex agent workflows
 - packages a narrow MCP driver for Docker image probes, allow-listed DeepSeek scan/patch artifacts, dynamic experiment harnesses, and isolated patch/test loops
-- separates MCP scan, plan, and patch paths: `deepseek_plan` is plan-only and rejects diff-shaped output at the server layer, while `deepseek_patch` supports `mode="plan"` and `mode="diff"` with artifact redaction and mechanical patch validation before harness use
+- separates MCP scan, plan, validate, and apply paths: `deepseek_plan` is plan-only and rejects diff-shaped output at the server layer; `deepseek_patch(mode="diff")` creates candidate patches; `validate_patch` converts a candidate into `validated_patch_id` after mechanical checks; `harness_apply_patch` prefers validated patch ids
 
-中文摘要：MCP driver 现在区分 scan / plan / patch。`deepseek_plan` 是 plan-only，服务端拒绝 diff；`deepseek_patch` 支持 plan/diff mode，输出落盘前会做 redaction，diff 必须先通过机械校验。
+中文摘要：MCP driver 现在区分 scan / plan / patch / validate / apply。`deepseek_plan` 是 plan-only，服务端拒绝 diff；`deepseek_patch` 只生成候选补丁；`validate_patch` 机械校验后生成 `validated_patch_id`；`harness_apply_patch` 优先使用 validated patch id。
 
 ## How It Works
 
@@ -62,12 +62,26 @@ This repository includes both layers:
 
 The MCP driver does not expose arbitrary shell access. Its DeepSeek tools read only allow-listed non-sensitive files and call the local Responses proxy directly. DeepSeek output is redacted before artifact persistence under `artifacts/deepseek/<run-id>/`.
 
-Plan and patch outputs are separated:
+Plan, patch, validation, and apply outputs are separated:
 
 - plan-mode output that contains unified diff markers is rejected with `PLAN_CONTAINS_DIFF` and does not write `patch.diff`
-- diff-mode output must pass `validate_patch_diff`, including sensitive-path checks and `git apply --check`, before `patch.diff` is saved
-- invalid patches are marked rejected and are not passed to `harness_apply_patch`
-- `harness_apply_patch` validates raw patch input before applying it to an isolated worktree
+- diff-mode output creates a candidate patch artifact and returns `candidate_patch_id`
+- `validate_patch` runs `validate_patch_diff`, including secret-like text, forbidden-path, dangerous host-access, and `git apply --check` checks, before returning `validated_patch_id`
+- invalid candidate patches are marked rejected or quarantine and are not passed to `harness_apply_patch`
+- `harness_apply_patch` prefers `validated_patch_id`; deprecated raw `patch_path` input is mechanically validated before isolated worktree apply
+
+### MCP Patch Pipeline
+
+```text
+deepseek_patch(mode="diff")
+  -> candidate_patch_id
+  -> validate_patch(candidate_patch_id)
+  -> validated_patch_id
+  -> Codex driver review
+  -> harness_apply_patch(validated_patch_id)
+```
+
+`validated_patch_id` is not a semantic safety guarantee. It only means the patch passed mechanical checks. Codex driver or user review remains required before applying, publishing, or merging any change.
 
 For the Codex-driver/DeepSeek-worker flow, the MCP server also supports:
 
@@ -100,8 +114,9 @@ Validated locally against:
 - policy split smoke test: `tokenizer.py` is allowed with a soft `token` warning, while `.env` and `.key` remain hard rejections
 - generated artifact smoke test: `deepseek_generate_artifact_file` extracts one Python code block, writes `latest` plus an attempt copy, runs it in Docker, and validates it with `harness_static_assertions`
 - MCP output validation tests: plan diff-marker rejection, secret-like redaction, corrupt patch rejection, forbidden-path rejection, and `needs_host_access` non-escalation
-- Dockerized MCP `tools/list` validation showing `deepseek_scan`, `deepseek_plan`, `deepseek_patch`, and `harness_apply_patch`
+- Dockerized MCP `tools/list` validation showing `deepseek_scan`, `deepseek_plan`, `deepseek_patch`, `validate_patch`, and `harness_apply_patch`
 - E2E DeepSeek MCP validation through the local Responses proxy: `deepseek_plan` accepted a normal plan and did not write `patch.diff`; `deepseek_patch` produced a corrupt patch and was rejected with `PATCH_APPLY_CHECK_FAILED`; no patch was applied automatically
+- MCP patch pipeline tests: candidate patch artifact creation, `validate_patch` success/failure paths, forbidden-path rejection, secret-like rejection, dangerous host-access rejection, and `harness_apply_patch(validated_patch_id)` behavior
 
 `PLAN_CONTAINS_DIFF` is covered by local tests. The E2E run covered the normal plan path and the patch-validation rejection path.
 
@@ -150,7 +165,8 @@ deepseek-codex-adapter/
     ├── mechanism-and-comparison.md
     └── github-publish-checklist.md
 tests/
-└── test_mcp_output_validation.py
+├── test_mcp_output_validation.py
+└── test_mcp_patch_pipeline.py
 ```
 
 ## Safety

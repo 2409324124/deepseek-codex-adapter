@@ -36,6 +36,7 @@ HARD_SENSITIVE_WORDS = ("secret", "credential", "private_key", "apikey", "api_ke
 SOFT_SENSITIVE_WORDS = ("token", "auth", "password", "session")
 IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,255}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
+PATCH_ID_RE = re.compile(r"^(candidate|validated)_\d{8}_\d{6}_[a-f0-9]{8}$")
 POLICY_PROFILES = ("strict-secrets", "ml-code", "web-app")
 DEFAULT_RESPONSES_BASE_URL = "http://127.0.0.1:4000/v1"
 MAX_ALLOWED_FILES = 80
@@ -109,6 +110,7 @@ REPO = Path(ARGS.repo).resolve()
 REPO_HOST_PATH = Path(ARGS.repo_host_path).resolve() if ARGS.repo_host_path else REPO
 ARTIFACT_ROOT = REPO / "artifacts" / "deepseek"
 HARNESS_ROOT = ARTIFACT_ROOT / "harness"
+PATCH_ROOT = ARTIFACT_ROOT / "patches"
 mcp = FastMCP("deepseek-driver")
 
 
@@ -192,6 +194,120 @@ def sha256_file(path: Path) -> str:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def timestamp_id_part() -> str:
+    return time.strftime("%Y%m%d_%H%M%S", time.localtime())
+
+
+def make_patch_id(prefix: str, patch_text: str) -> str:
+    if prefix not in {"candidate", "validated"}:
+        raise ValueError("patch id prefix must be candidate or validated")
+    digest = sha256_text(patch_text)[:8]
+    return f"{prefix}_{timestamp_id_part()}_{digest}"
+
+
+def patch_artifact_dir(patch_id: str) -> Path:
+    if not PATCH_ID_RE.fullmatch(patch_id):
+        raise ValueError("invalid patch_id")
+    root = PATCH_ROOT.resolve()
+    target = (PATCH_ROOT / patch_id).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("patch_id escapes patch artifact root") from exc
+    return target
+
+
+def write_patch_artifact(
+    *,
+    patch_id: str,
+    patch_text: str,
+    patch_kind: str,
+    artifact_status: str,
+    source_tool: str,
+    run_id: str | None,
+    redacted: bool = False,
+    error_code: str | None = None,
+    validation: dict[str, Any] | None = None,
+    paths: list[str] | None = None,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    if patch_kind not in {"candidate", "validated"}:
+        raise ValueError("patch_kind must be candidate or validated")
+    if artifact_status not in {"candidate", "validated", "rejected", "quarantine"}:
+        raise ValueError("unsupported artifact_status")
+    if patch_kind == "candidate" and not patch_id.startswith("candidate_"):
+        raise ValueError("candidate artifacts require candidate_ patch ids")
+    if patch_kind == "validated" and not patch_id.startswith("validated_"):
+        raise ValueError("validated artifacts require validated_ patch ids")
+
+    target = patch_artifact_dir(patch_id)
+    target.mkdir(parents=True, exist_ok=True)
+    patch_path = target / "patch.diff"
+    patch_path.write_text(patch_text, encoding="utf-8")
+    metadata = {
+        "patch_id": patch_id,
+        "patch_kind": patch_kind,
+        "artifact_status": artifact_status,
+        "source_tool": source_tool,
+        "run_id": run_id,
+        "redacted": bool(redacted),
+        "error_code": error_code,
+        "validation": validation,
+        "created_at_ms": now_ms(),
+        "patch_sha256": sha256_text(patch_text),
+        "paths": paths if paths is not None else patch_paths(patch_text),
+        "warnings": warnings or [],
+    }
+    write_json(target / "metadata.json", metadata)
+    return {
+        "patch_id": patch_id,
+        "patch_dir": str(target),
+        "patch_path": str(patch_path),
+        "metadata_path": str(target / "metadata.json"),
+        "metadata": metadata,
+    }
+
+
+def load_patch_artifact(patch_id: str) -> dict[str, Any]:
+    try:
+        target = patch_artifact_dir(patch_id)
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "returncode": 2,
+            "error_code": "PATCH_ID_INVALID",
+            "message": str(exc),
+        }
+    metadata_path = target / "metadata.json"
+    patch_path = target / "patch.diff"
+    if not metadata_path.exists() or not patch_path.exists():
+        return {
+            "ok": False,
+            "returncode": 2,
+            "error_code": "PATCH_ARTIFACT_NOT_FOUND",
+            "message": f"patch artifact not found: {patch_id}",
+        }
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return {
+            "ok": False,
+            "returncode": 2,
+            "error_code": "PATCH_METADATA_INVALID",
+            "message": str(exc),
+        }
+    return {
+        "ok": True,
+        "returncode": 0,
+        "patch_id": patch_id,
+        "patch_dir": str(target),
+        "patch_path": str(patch_path),
+        "metadata_path": str(metadata_path),
+        "metadata": metadata,
+        "patch_text": patch_path.read_text(encoding="utf-8", errors="replace"),
+    }
 
 
 def harness_dir(run_id: str | None) -> Path:
@@ -528,7 +644,8 @@ def validate_patch_diff(diff: str, *, cwd: Path | None = None, timeout: int = 12
         "ok": True,
         "error_code": None,
         "message": "patch passed validation",
-        "validated_patch_id": hashlib.sha256(redacted_diff.encode("utf-8")).hexdigest()[:24],
+        "validated_patch_id": None,
+        "patch_sha256": sha256_text(redacted_diff),
         "paths": paths,
         "check": check,
     }
@@ -684,6 +801,7 @@ def run_deepseek_file_workflow(
     run_id: str | None,
     timeout: int,
     mode: str,
+    auto_validate: bool = False,
 ) -> dict[str, Any]:
     if mode not in {"scan", "plan", "diff"}:
         raise ValueError("mode must be one of: scan, plan, diff")
@@ -715,6 +833,8 @@ def run_deepseek_file_workflow(
         "prompt_path": str(prompt_path),
         "output_path": str(output_path),
         "included_paths": included,
+        "candidate_patch_id": None,
+        "validated_patch_id": None,
     }
 
     if mode == "plan":
@@ -737,7 +857,27 @@ def run_deepseek_file_workflow(
             result["patch_path"] = None
     elif mode == "diff":
         diff = extract_diff_block(output)
-        if not diff:
+        if redacted:
+            status = "quarantine"
+            error_code = "PATCH_CONTAINS_SECRET_LIKE_TEXT"
+            validation = {
+                "ok": False,
+                "error_code": error_code,
+                "message": "DeepSeek patch output contained secret-like text and was quarantined.",
+                "validated_patch_id": None,
+            }
+            result.update(
+                {
+                    "returncode": 2,
+                    "stderr": validation["message"],
+                    "artifact_status": status,
+                    "error_code": error_code,
+                    "validation": validation,
+                    "patch_path": None,
+                    "candidate_patch_path": None,
+                }
+            )
+        elif not diff:
             status = "quarantine" if redacted else "rejected"
             error_code = "PATCH_MISSING_DIFF"
             validation = {
@@ -754,33 +894,53 @@ def run_deepseek_file_workflow(
                     "error_code": error_code,
                     "validation": validation,
                     "patch_path": None,
+                    "candidate_patch_path": None,
                 }
             )
         else:
-            validation = validate_patch_diff(diff, cwd=REPO, timeout=timeout)
-            if validation["ok"] and not redacted:
-                patch_path = artifact_dir / "patch.diff"
-                patch_path.write_text(diff, encoding="utf-8")
-                result.update(
-                    {
-                        "patch_path": str(patch_path),
-                        "validated_patch_id": validation["validated_patch_id"],
-                        "validation": validation,
-                    }
+            candidate_patch_id = make_patch_id("candidate", diff)
+            candidate = write_patch_artifact(
+                patch_id=candidate_patch_id,
+                patch_text=diff,
+                patch_kind="candidate",
+                artifact_status="candidate",
+                source_tool="deepseek_patch",
+                run_id=run_id,
+                validation={
+                    "ok": None,
+                    "error_code": None,
+                    "message": "candidate patch generated; call validate_patch before apply",
+                },
+            )
+            validation = candidate["metadata"]["validation"]
+            result.update(
+                {
+                    "artifact_status": "candidate",
+                    "patch_path": None,
+                    "candidate_patch_id": candidate_patch_id,
+                    "candidate_patch_path": candidate["patch_path"],
+                    "candidate_metadata_path": candidate["metadata_path"],
+                    "validation": validation,
+                }
+            )
+            if auto_validate:
+                validation_result = validate_patch_candidate_artifact(
+                    candidate_patch_id=candidate_patch_id,
+                    run_id=run_id,
+                    timeout=timeout,
                 )
-            else:
-                status = "quarantine" if redacted else "rejected"
-                error_code = validation["error_code"]
-                result.update(
-                    {
-                        "returncode": 2,
-                        "stderr": validation["message"],
-                        "artifact_status": status,
-                        "error_code": error_code,
-                        "validation": validation,
-                        "patch_path": None,
-                    }
-                )
+                result["auto_validate"] = validation_result
+                result["validated_patch_id"] = validation_result.get("validated_patch_id")
+                if not validation_result.get("ok"):
+                    result.update(
+                        {
+                            "returncode": 2,
+                            "stderr": validation_result.get("message", "patch validation failed"),
+                            "artifact_status": validation_result.get("artifact_status", "rejected"),
+                            "error_code": validation_result.get("error_code"),
+                            "validation": validation_result.get("validation"),
+                        }
+                    )
     metadata = {
         "run_id": run_id,
         "mode": mode,
@@ -788,10 +948,128 @@ def run_deepseek_file_workflow(
         "redacted": result["redacted"],
         "error_code": result.get("error_code"),
         "validation": result.get("validation"),
+        "candidate_patch_id": result.get("candidate_patch_id"),
+        "validated_patch_id": result.get("validated_patch_id"),
         "included_paths": included,
     }
     result["metadata_path"] = str(write_workflow_metadata(artifact_dir, metadata))
     return result
+
+
+def validate_patch_candidate_artifact(
+    *,
+    candidate_patch_id: str | None = None,
+    patch_path: str | None = None,
+    run_id: str | None = None,
+    timeout: int = 120,
+    source_tool: str = "validate_patch",
+) -> dict[str, Any]:
+    warnings: list[str] = []
+    loaded: dict[str, Any] | None = None
+    patch_text: str
+    candidate_id: str | None = None
+
+    if candidate_patch_id:
+        loaded = load_patch_artifact(candidate_patch_id)
+        if not loaded["ok"]:
+            return loaded
+        metadata = loaded["metadata"]
+        if metadata.get("patch_kind") != "candidate":
+            return {
+                "ok": False,
+                "returncode": 2,
+                "artifact_status": metadata.get("artifact_status"),
+                "candidate_patch_id": candidate_patch_id,
+                "validated_patch_id": None,
+                "error_code": "PATCH_ID_NOT_CANDIDATE",
+                "message": "validate_patch requires a candidate patch artifact.",
+            }
+        patch_text = loaded["patch_text"]
+        candidate_id = candidate_patch_id
+    elif patch_path:
+        warnings.append("patch_path is deprecated; use candidate_patch_id.")
+        patch_rel = validate_repo_path(patch_path, must_exist=True)
+        patch_abs = REPO / patch_rel
+        if not patch_abs.name.endswith((".diff", ".patch")):
+            return {
+                "ok": False,
+                "returncode": 2,
+                "artifact_status": "rejected",
+                "candidate_patch_id": None,
+                "validated_patch_id": None,
+                "error_code": "PATCH_INVALID_PATH",
+                "message": "patch_path must end with .diff or .patch",
+                "warnings": warnings,
+            }
+        patch_text = patch_abs.read_text(encoding="utf-8", errors="replace")
+    else:
+        return {
+            "ok": False,
+            "returncode": 2,
+            "artifact_status": "rejected",
+            "candidate_patch_id": None,
+            "validated_patch_id": None,
+            "error_code": "PATCH_INPUT_REQUIRED",
+            "message": "candidate_patch_id or deprecated patch_path is required",
+        }
+
+    validation = validate_patch_diff(patch_text, cwd=REPO, timeout=timeout)
+    if not validation["ok"]:
+        status = "quarantine" if validation.get("error_code") == "PATCH_CONTAINS_SECRET_LIKE_TEXT" else "rejected"
+        if candidate_id:
+            persisted_patch_text = patch_text
+            redacted = False
+            if status == "quarantine":
+                persisted_patch_text, redacted = redact_secret_like_text(patch_text)
+            write_patch_artifact(
+                patch_id=candidate_id,
+                patch_text=persisted_patch_text,
+                patch_kind="candidate",
+                artifact_status=status,
+                source_tool=source_tool,
+                run_id=run_id,
+                redacted=bool(validation.get("redacted")) or redacted,
+                error_code=validation.get("error_code"),
+                validation=validation,
+                warnings=warnings,
+            )
+        return {
+            "ok": False,
+            "returncode": 2,
+            "artifact_status": status,
+            "candidate_patch_id": candidate_id,
+            "validated_patch_id": None,
+            "error_code": validation.get("error_code"),
+            "message": validation.get("message"),
+            "validation": validation,
+            "warnings": warnings,
+        }
+
+    validated_patch_id = make_patch_id("validated", patch_text)
+    validated = write_patch_artifact(
+        patch_id=validated_patch_id,
+        patch_text=patch_text,
+        patch_kind="validated",
+        artifact_status="validated",
+        source_tool=source_tool,
+        run_id=run_id,
+        validation=validation,
+        paths=validation.get("paths"),
+        warnings=warnings,
+    )
+    return {
+        "ok": True,
+        "returncode": 0,
+        "artifact_status": "validated",
+        "candidate_patch_id": candidate_id,
+        "validated_patch_id": validated_patch_id,
+        "validated_patch_path": validated["patch_path"],
+        "validated_metadata_path": validated["metadata_path"],
+        "error_code": None,
+        "message": "patch passed mechanical validation; Codex driver review is still required",
+        "validation": validation,
+        "warnings": warnings,
+    }
 
 
 def copy_ignore(directory: str, names: list[str]) -> set[str]:
@@ -1322,29 +1600,132 @@ def harness_create_worktree(run_id: str, base_ref: str = "working-copy") -> dict
 
 
 @mcp.tool()
-def harness_apply_patch(run_id: str, patch_path: str, timeout: int = 120) -> dict[str, Any]:
-    """Apply an artifact patch to the isolated harness worktree, never to the real repo.
+def validate_patch(
+    candidate_patch_id: str | None = None,
+    patch_path: str | None = None,
+    run_id: str | None = None,
+    timeout: int = 120,
+) -> dict[str, Any]:
+    """Validate a candidate patch and return validated_patch_id after mechanical checks.
 
-    Patch content safety remains the Codex driver's review responsibility; this
-    tool only validates basic patch policy, then guarantees path isolation and
-    worktree-only application. Docker daemon access remains a HIGH TRUST
-    boundary, and needs_host_access is not a permission switch.
+    This is not semantic security review and does not replace Codex driver
+    review. patch_path is a deprecated compatibility input; prefer
+    candidate_patch_id.
+    """
+    return validate_patch_candidate_artifact(
+        candidate_patch_id=candidate_patch_id,
+        patch_path=patch_path,
+        run_id=run_id,
+        timeout=timeout,
+        source_tool="validate_patch",
+    )
+
+
+@mcp.tool()
+def harness_apply_patch(
+    run_id: str,
+    validated_patch_id: str | None = None,
+    patch_path: str | None = None,
+    timeout: int = 120,
+) -> dict[str, Any]:
+    """Apply a validated patch to the isolated harness worktree, never to the real repo.
+
+    Prefer validated_patch_id. The deprecated patch_path compatibility input is
+    mechanically validated before use. Patch content safety remains the
+    Codex driver review responsibility; validated_patch_id only means format,
+    sensitive-path, secret-like, dangerous host-access, and git apply checks
+    passed. MCP only provides basic validation and isolated worktree
+    application. Docker daemon access remains a HIGH TRUST boundary, and
+    needs_host_access is not a permission switch.
     """
     run_id, root = ensure_harness_workspace(run_id)
     worktree = root / "worktrees" / "repo"
     if not worktree.exists():
         raise ValueError("missing isolated worktree; call harness_create_worktree first")
-    patch_rel = validate_repo_path(patch_path, must_exist=True)
-    patch_abs = REPO / patch_rel
-    if not patch_abs.name.endswith((".diff", ".patch")):
-        raise ValueError("patch_path must end with .diff or .patch")
-    patch_text = patch_abs.read_text(encoding="utf-8", errors="replace")
-    validation = validate_patch_diff(patch_text, cwd=worktree, timeout=timeout)
-    if not validation["ok"]:
+    warnings: list[str] = []
+    patch_text: str
+    stored_name: str
+    validation: dict[str, Any]
+    source_ref: str | None = None
+
+    if validated_patch_id:
+        loaded = load_patch_artifact(validated_patch_id)
+        if not loaded["ok"]:
+            event = {
+                "type": "apply_patch",
+                "status": "rejected",
+                "patch_id": validated_patch_id,
+                "returncode": 2,
+                "validation": loaded,
+            }
+            append_harness_event(root, event)
+            return {
+                "returncode": 2,
+                "run_id": run_id,
+                "worktree_path": str(worktree),
+                "stored_patch": None,
+                "validated_patch_id": validated_patch_id,
+                "validation": loaded,
+                "check": None,
+                "apply": None,
+                "warnings": warnings,
+            }
+        metadata = loaded["metadata"]
+        metadata_validation = metadata.get("validation") or {}
+        if (
+            metadata.get("patch_kind") != "validated"
+            or metadata.get("artifact_status") != "validated"
+            or metadata_validation.get("ok") is not True
+        ):
+            validation = {
+                "ok": False,
+                "error_code": "PATCH_NOT_VALIDATED",
+                "message": "harness_apply_patch requires a validated patch artifact.",
+                "validated_patch_id": None,
+            }
+            event = {
+                "type": "apply_patch",
+                "status": "rejected",
+                "patch_id": validated_patch_id,
+                "returncode": 2,
+                "validation": validation,
+            }
+            append_harness_event(root, event)
+            return {
+                "returncode": 2,
+                "run_id": run_id,
+                "worktree_path": str(worktree),
+                "stored_patch": None,
+                "validated_patch_id": validated_patch_id,
+                "validation": validation,
+                "check": None,
+                "apply": None,
+                "warnings": warnings,
+            }
+        patch_text = loaded["patch_text"]
+        stored_name = f"{validated_patch_id}.diff"
+        source_ref = validated_patch_id
+        validation = validate_patch_diff(patch_text, cwd=worktree, timeout=timeout)
+    elif patch_path:
+        warnings.append("patch_path is deprecated; use validated_patch_id.")
+        patch_rel = validate_repo_path(patch_path, must_exist=True)
+        patch_abs = REPO / patch_rel
+        if not patch_abs.name.endswith((".diff", ".patch")):
+            raise ValueError("patch_path must end with .diff or .patch")
+        patch_text = patch_abs.read_text(encoding="utf-8", errors="replace")
+        validation = validate_patch_diff(patch_text, cwd=worktree, timeout=timeout)
+        stored_name = patch_abs.name
+        source_ref = str(patch_rel)
+    else:
+        validation = {
+            "ok": False,
+            "error_code": "PATCH_INPUT_REQUIRED",
+            "message": "validated_patch_id or deprecated patch_path is required",
+            "validated_patch_id": None,
+        }
         event = {
             "type": "apply_patch",
             "status": "rejected",
-            "path": str(patch_rel),
             "returncode": 2,
             "validation": validation,
         }
@@ -1354,13 +1735,49 @@ def harness_apply_patch(run_id: str, patch_path: str, timeout: int = 120) -> dic
             "run_id": run_id,
             "worktree_path": str(worktree),
             "stored_patch": None,
+            "validated_patch_id": None,
             "validation": validation,
             "check": None,
             "apply": None,
+            "warnings": warnings,
         }
-    stored_patch = root / "patches" / patch_abs.name
-    if patch_abs.resolve() != stored_patch.resolve():
-        shutil.copy2(patch_abs, stored_patch)
+
+    if not validation["ok"]:
+        event = {
+            "type": "apply_patch",
+            "status": "rejected",
+            "path": source_ref,
+            "returncode": 2,
+            "validation": validation,
+            "warnings": warnings,
+        }
+        append_harness_event(root, event)
+        return {
+            "returncode": 2,
+            "run_id": run_id,
+            "worktree_path": str(worktree),
+            "stored_patch": None,
+            "validated_patch_id": validated_patch_id,
+            "validation": validation,
+            "check": None,
+            "apply": None,
+            "warnings": warnings,
+        }
+    if not validated_patch_id:
+        validated_patch_id = make_patch_id("validated", patch_text)
+        write_patch_artifact(
+            patch_id=validated_patch_id,
+            patch_text=patch_text,
+            patch_kind="validated",
+            artifact_status="validated",
+            source_tool="harness_apply_patch",
+            run_id=run_id,
+            validation=validation,
+            paths=validation.get("paths"),
+            warnings=warnings,
+        )
+    stored_patch = root / "patches" / stored_name
+    stored_patch.write_text(patch_text, encoding="utf-8")
     timeout = max(1, min(int(timeout), 600))
     check = run_local_command(["git", "apply", "--check", str(stored_patch)], cwd=worktree, timeout=timeout)
     applied = None
@@ -1371,7 +1788,9 @@ def harness_apply_patch(run_id: str, patch_path: str, timeout: int = 120) -> dic
         "status": "ok" if applied and applied["returncode"] == 0 else "failed",
         "path": str(stored_patch.relative_to(root)),
         "returncode": check["returncode"] if not applied else applied["returncode"],
-        "validated_patch_id": validation.get("validated_patch_id"),
+        "validated_patch_id": validated_patch_id,
+        "source": source_ref,
+        "warnings": warnings,
     }
     append_harness_event(root, event)
     return {
@@ -1379,10 +1798,11 @@ def harness_apply_patch(run_id: str, patch_path: str, timeout: int = 120) -> dic
         "run_id": run_id,
         "worktree_path": str(worktree),
         "stored_patch": str(stored_patch),
-        "validated_patch_id": validation.get("validated_patch_id"),
+        "validated_patch_id": validated_patch_id,
         "validation": validation,
         "check": check,
         "apply": applied,
+        "warnings": warnings,
     }
 
 
@@ -1456,14 +1876,14 @@ def harness_feedback_to_deepseek(
         allow_paths=allow_paths,
         run_id=f"{run_id}-feedback",
         timeout=timeout,
-        patch=True,
+        mode="diff",
     )
     append_harness_event(
         root,
         {
             "type": "feedback_to_deepseek",
             "status": "ok" if result["returncode"] == 0 else "failed",
-            "path": result.get("patch_path") or result.get("output_path"),
+            "path": result.get("candidate_patch_path") or result.get("patch_path") or result.get("output_path"),
             "returncode": result["returncode"],
         },
     )
@@ -1549,12 +1969,15 @@ def deepseek_patch(
     timeout: int = 180,
     needs_host_access: bool = False,
     mode: str = "diff",
+    auto_validate: bool = False,
 ) -> dict[str, Any]:
-    """Read only allow-listed files, ask DeepSeek for a patch draft, and save artifacts.
+    """Read only allow-listed files, ask DeepSeek for a candidate patch, and save artifacts.
 
     needs_host_access is reserved for future policy signaling and does not grant
     additional permissions. mode="plan" rejects diff markers and never writes
-    patch.diff; mode="diff" validates a patch before saving patch.diff.
+    patch.diff; mode="diff" creates a candidate_patch_id. Call validate_patch
+    to turn a candidate into validated_patch_id before harness_apply_patch.
+    auto_validate is kept for compatibility and should normally stay false.
     """
     selected_mode = mode.lower().strip()
     if selected_mode not in {"plan", "diff"}:
@@ -1565,6 +1988,7 @@ def deepseek_patch(
         run_id=run_id,
         timeout=timeout,
         mode=selected_mode,
+        auto_validate=bool(auto_validate),
     )
 
 

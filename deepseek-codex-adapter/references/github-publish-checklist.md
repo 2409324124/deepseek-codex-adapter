@@ -17,7 +17,8 @@ deepseek-codex-adapter/
     ├── mechanism-and-comparison.md
     └── github-publish-checklist.md
 tests/
-└── test_mcp_output_validation.py
+├── test_mcp_output_validation.py
+└── test_mcp_patch_pipeline.py
 ```
 
 Do not publish:
@@ -41,6 +42,7 @@ Run from the skill folder or parent workspace:
 python3 -m py_compile scripts/deepseek_responses_proxy.py
 python3 -m py_compile scripts/deepseek_driver_mcp.py
 python3 -m pytest ../tests/test_mcp_output_validation.py -q
+python3 -m pytest ../tests/test_mcp_patch_pipeline.py -q
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
 docker build -t deepseek-driver-mcp:local -f docker/mcp-driver.Dockerfile .
 git diff --check
@@ -71,7 +73,11 @@ Before pushing, also confirm:
 - `__pycache__/` and `*.pyc` are absent.
 - README does not claim Docker or MCP is absolutely safe.
 - README does not claim DeepSeek patches can be automatically trusted.
+- README does not claim `validated_patch_id` means a patch is semantically safe.
 - README says Codex driver or user review is still required.
+- `tools/list` includes `validate_patch`.
+- `SKILL.md` enabled tools include `validate_patch`.
+- `harness_apply_patch` docs prefer `validated_patch_id`; `patch_path` remains deprecated compatibility only.
 
 ## Suggested Repository Shape
 

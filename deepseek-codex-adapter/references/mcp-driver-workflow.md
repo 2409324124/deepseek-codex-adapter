@@ -39,7 +39,7 @@ Recommended config for the full Codex-driver/DeepSeek-worker harness:
 
 ```toml
 [mcp_servers.deepseek-driver]
-enabled_tools = ["docker_list_images", "docker_probe_torch", "docker_run_python_script", "harness_create_workspace", "harness_policy_check", "harness_write_file", "deepseek_generate_artifact_file", "harness_run_temp_script", "harness_static_assertions", "harness_create_worktree", "harness_apply_patch", "harness_run_repo_tests", "harness_feedback_to_deepseek", "harness_collect_report", "deepseek_scan", "deepseek_plan", "deepseek_patch"]
+enabled_tools = ["docker_list_images", "docker_probe_torch", "docker_run_python_script", "harness_create_workspace", "harness_policy_check", "harness_write_file", "deepseek_generate_artifact_file", "harness_run_temp_script", "harness_static_assertions", "harness_create_worktree", "harness_apply_patch", "harness_run_repo_tests", "harness_feedback_to_deepseek", "harness_collect_report", "deepseek_scan", "deepseek_plan", "deepseek_patch", "validate_patch"]
 startup_timeout_sec = 60
 tool_timeout_sec = 600
 ```
@@ -56,13 +56,14 @@ tool_timeout_sec = 600
 - `harness_run_temp_script(run_id, image, script_path, timeout, network_disabled=True, attempt_label=None)`: runs an artifact Python script in Docker with `/repo` read-only and `/artifact` read-write. When `attempt_label` is set, the log path is versioned. Use returned `log_relative_path` when calling `harness_static_assertions(log_path=...)`.
 - `harness_static_assertions(run_id, ...)`: checks generated code, stdout/stderr, return code, runtime, required markers, and task-specific forbidden strings. The default `ml-code` profile does not treat `token` as forbidden code.
 - `harness_create_worktree(run_id, base_ref="working-copy")`: creates a sanitized isolated repository copy under the harness workspace.
-- `harness_apply_patch(run_id, patch_path, timeout=120)`: validates raw patch input, runs `git apply --check`, and applies the patch only inside the isolated worktree.
+- `harness_apply_patch(run_id, validated_patch_id, patch_path=None, timeout=120)`: applies a validated patch only inside the isolated worktree. Prefer `validated_patch_id`; deprecated `patch_path` input is validated before use.
 - `harness_run_repo_tests(run_id, image, test_template, timeout=600, network_disabled=True)`: runs only an allow-listed template: `pytest`, `python -m pytest`, or `npm test`.
 - `harness_feedback_to_deepseek(run_id, failure_log, allow_paths, timeout=180)`: sends a bounded failure summary plus allow-listed files to DeepSeek for a revised patch draft.
 - `harness_collect_report(run_id)`: writes `reports/report.json` and `reports/report.md` for Codex review.
 - `deepseek_scan(task, allow_paths, run_id, timeout=180)`: reads only allow-listed non-sensitive files, calls the local Responses proxy, and writes redacted `prompt.md` plus `deepseek-output.md`.
 - `deepseek_plan(task, allow_paths, run_id, timeout=180)`: asks for plan-only output. Diff markers are rejected with `PLAN_CONTAINS_DIFF`, and `patch.diff` is never written.
-- `deepseek_patch(task, allow_paths, run_id, timeout=180, mode="diff")`: same read boundary as scan. `mode="plan"` uses plan validation; `mode="diff"` validates a unified diff before saving accepted `patch.diff`.
+- `deepseek_patch(task, allow_paths, run_id, timeout=180, mode="diff")`: same read boundary as scan. `mode="plan"` uses plan validation; `mode="diff"` creates a candidate patch artifact and returns `candidate_patch_id`.
+- `validate_patch(candidate_patch_id, patch_path=None, run_id=None, timeout=120)`: validates a candidate patch and returns `validated_patch_id` after mechanical checks. Deprecated `patch_path` input is accepted only for compatibility.
 
 ## Scan / Plan / Patch Validation Flow
 
@@ -72,12 +73,16 @@ tool_timeout_sec = 600
 4. Codex driver reviews the plan.
 5. Codex driver calls `deepseek_patch(mode="diff")` for a candidate patch.
 6. MCP redacts secret-like content before persisting output.
-7. MCP validates diff patches with `validate_patch_diff`.
-8. Invalid patches are rejected and do not produce accepted `patch.diff` for apply.
-9. `harness_apply_patch` validates raw patch input and applies only into an isolated worktree.
-10. Codex driver review remains required.
+7. `deepseek_patch` returns `candidate_patch_id`; candidate patches are not applyable by default.
+8. Codex driver reviews the candidate patch proposal.
+9. Codex driver calls `validate_patch(candidate_patch_id=...)`.
+10. MCP validates diff patches with `validate_patch_diff`.
+11. Invalid patches are rejected and do not produce `validated_patch_id`.
+12. Valid patches produce `validated_patch_id`.
+13. Codex driver review remains required because `validated_patch_id` is mechanical validation, not a semantic safety guarantee.
+14. `harness_apply_patch(validated_patch_id=...)` applies only into an isolated worktree.
 
-`harness_apply_patch` applying a patch in an isolated worktree does not mean the patch is semantically safe. It only means the patch passed mechanical checks and was applied outside the real repository.
+`harness_apply_patch` applying a patch in an isolated worktree does not mean the patch is semantically safe. It only means the patch passed mechanical checks and was applied outside the real repository. Deprecated `patch_path` input remains for compatibility but is validated before use.
 
 ## Security Boundary
 
@@ -116,17 +121,18 @@ Run these before claiming the MCP driver is usable:
 4. `deepseek_scan` succeeds on one safe allow-listed file and writes `artifacts/deepseek/<run-id>/deepseek-output.md`.
 5. `deepseek_scan` with `.env` fails with a sensitive-path rejection.
 6. `deepseek_plan` accepts plan-only output and rejects diff-shaped output with `PLAN_CONTAINS_DIFF`.
-7. `deepseek_patch(mode="diff")` writes accepted `patch.diff` only after patch validation succeeds.
-8. corrupt or forbidden-path patches are rejected and do not enter `harness_apply_patch`.
-9. `harness_policy_check` rejects `.env`, `.key`, `.git`, and `../` paths.
-10. `harness_policy_check(policy_profile="ml-code")` allows `scripts/tokenizer.py` while reporting a soft `token` hit.
-11. `deepseek_generate_artifact_file` writes both a latest file and a versioned attempt copy.
-12. `harness_run_temp_script(attempt_label=...)` writes a versioned log.
-13. `harness_static_assertions` passes with default `ml-code` when generated code contains `token`, and fails when `forbidden_code=["token"]` is explicitly requested.
-14. `harness_run_temp_script` can run a temporary artifact Python script and write to `outputs/`.
-15. `harness_apply_patch` applies a validated patch to the isolated worktree and leaves the real repository untouched.
-16. `harness_run_repo_tests` runs an allow-listed template in Docker and logs stdout/stderr.
-17. `harness_feedback_to_deepseek` can turn a bounded failure log plus allow-listed files into a revised patch draft.
+7. `deepseek_patch(mode="diff")` returns `candidate_patch_id` and does not make the patch applyable by default.
+8. `validate_patch(candidate_patch_id=...)` returns `validated_patch_id` only after mechanical checks pass.
+9. corrupt, secret-like, forbidden-path, or dangerous host-access patches are rejected and do not enter `harness_apply_patch`.
+10. `harness_policy_check` rejects `.env`, `.key`, `.git`, and `../` paths.
+11. `harness_policy_check(policy_profile="ml-code")` allows `scripts/tokenizer.py` while reporting a soft `token` hit.
+12. `deepseek_generate_artifact_file` writes both a latest file and a versioned attempt copy.
+13. `harness_run_temp_script(attempt_label=...)` writes a versioned log.
+14. `harness_static_assertions` passes with default `ml-code` when generated code contains `token`, and fails when `forbidden_code=["token"]` is explicitly requested.
+15. `harness_run_temp_script` can run a temporary artifact Python script and write to `outputs/`.
+16. `harness_apply_patch(validated_patch_id=...)` applies a validated patch to the isolated worktree and leaves the real repository untouched.
+17. `harness_run_repo_tests` runs an allow-listed template in Docker and logs stdout/stderr.
+18. `harness_feedback_to_deepseek` can turn a bounded failure log plus allow-listed files into a revised patch draft.
 
 ## Harness Levels
 
