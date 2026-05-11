@@ -248,6 +248,8 @@ def attempt_path(root: Path, directory: str, source_rel: Path, attempt_id: str) 
 
 
 def docker_client() -> docker.DockerClient:
+    # HIGH TRUST: this uses the host Docker daemon exposed by the MCP launcher.
+    # Keep all Docker access behind narrow, allow-listed tools.
     return docker.from_env()
 
 
@@ -1048,7 +1050,11 @@ def harness_create_worktree(run_id: str, base_ref: str = "working-copy") -> dict
 
 @mcp.tool()
 def harness_apply_patch(run_id: str, patch_path: str, timeout: int = 120) -> dict[str, Any]:
-    """Apply an artifact patch to the isolated harness worktree, never to the real repo."""
+    """Apply an artifact patch to the isolated harness worktree, never to the real repo.
+
+    Patch content safety remains the Codex driver's review responsibility; this
+    tool only guarantees path isolation and worktree-only application.
+    """
     run_id, root = ensure_harness_workspace(run_id)
     worktree = root / "worktrees" / "repo"
     if not worktree.exists():
@@ -1201,7 +1207,11 @@ def deepseek_scan(
     timeout: int = 180,
     needs_host_access: bool = False,
 ) -> dict[str, Any]:
-    """Read only allow-listed files, call the local Responses proxy, and save artifacts."""
+    """Read only allow-listed files, call the local Responses proxy, and save artifacts.
+
+    needs_host_access is reserved for future policy signaling and does not grant
+    additional permissions.
+    """
     return run_deepseek_file_workflow(
         task=task,
         allow_paths=allow_paths,
@@ -1219,7 +1229,11 @@ def deepseek_patch(
     timeout: int = 180,
     needs_host_access: bool = False,
 ) -> dict[str, Any]:
-    """Read only allow-listed files, ask DeepSeek for a patch draft, and save artifacts."""
+    """Read only allow-listed files, ask DeepSeek for a patch draft, and save artifacts.
+
+    needs_host_access is reserved for future policy signaling and does not grant
+    additional permissions.
+    """
     return run_deepseek_file_workflow(
         task=task,
         allow_paths=allow_paths,
