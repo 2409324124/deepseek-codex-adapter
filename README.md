@@ -14,7 +14,7 @@ This project provides a local adapter that:
 - supports Codex shell/tool calls, multi-turn continuation, and same-turn parallel tool calls
 - disables DeepSeek thinking mode to avoid unsupported `reasoning_content` round-trips during tool use
 - includes bounded smoke tests for real Codex agent workflows
-- packages a narrow MCP driver for Docker image probes and allow-listed DeepSeek scan/patch artifacts
+- packages a narrow MCP driver for Docker image probes, allow-listed DeepSeek scan/patch artifacts, dynamic experiment harnesses, and isolated patch/test loops
 
 ## How It Works
 
@@ -59,6 +59,15 @@ This repository includes both layers:
 
 The MCP driver does not expose arbitrary shell access. Its DeepSeek tools read only allow-listed non-sensitive files, call the local Responses proxy directly, and save `prompt.md`, `deepseek-output.md`, and optional `patch.diff` under `artifacts/deepseek/<run-id>/`.
 
+For the Codex-driver/DeepSeek-worker flow, the MCP server also supports:
+
+- artifact workspaces under `artifacts/deepseek/harness/<run-id>/`
+- temporary script execution in Docker with the repo mounted read-only
+- isolated sanitized repository copies for patch checking
+- allow-listed test templates such as `python -m pytest`
+- bounded failure feedback to DeepSeek for revised patch drafts
+- JSON and Markdown reports for Codex review
+
 Hosted LiteLLM-style gateways can be useful, but they broaden the trust boundary. This project defaults to a local Python standard-library proxy bound to `127.0.0.1`, so the DeepSeek API key stays on the user's machine.
 
 ## Status
@@ -74,6 +83,8 @@ Validated locally against:
 - parallel call with one expected failure and a recovery call
 - bounded read-only repository analysis excluding `.env`, `.key`, `.git`, `node_modules`, and test output folders
 - Dockerized MCP protocol self-test with `tools/list`, PyTorch image probe, sensitive path rejection, `deepseek_scan`, and `deepseek_patch`
+- LV4 harness smoke test: write an artifact Python script, run it in `cat-psych:cpu`, and write output under `artifacts/`
+- LV5 harness smoke test: create an isolated worktree, apply a patch there, run `python -m pytest`, collect a report, and feed a bounded failure summary back to DeepSeek
 
 Known Codex CLI boundary:
 

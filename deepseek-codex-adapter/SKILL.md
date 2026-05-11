@@ -42,19 +42,22 @@ codex mcp add deepseek-driver -- \
     --repo-host-path /path/to/repo
 ```
 
-4. In `~/.codex/config.toml`, keep the tool surface narrow:
+4. In `~/.codex/config.toml`, keep the tool surface narrow. For scan/patch only, enable the basic tools. For the full Codex-driver/DeepSeek-worker harness, also enable the `harness_*` tools:
 
 ```toml
 [mcp_servers.deepseek-driver]
-enabled_tools = ["docker_list_images", "docker_probe_torch", "docker_run_python_script", "deepseek_scan", "deepseek_patch"]
+enabled_tools = ["docker_list_images", "docker_probe_torch", "docker_run_python_script", "harness_create_workspace", "harness_policy_check", "harness_write_file", "harness_run_temp_script", "harness_create_worktree", "harness_apply_patch", "harness_run_repo_tests", "harness_feedback_to_deepseek", "harness_collect_report", "deepseek_scan", "deepseek_patch"]
 startup_timeout_sec = 60
 tool_timeout_sec = 600
 ```
 
 5. Validate through MCP before using it for work:
-   - `tools/list` shows the five whitelist tools.
+   - `tools/list` shows only the expected whitelist tools.
    - `docker_probe_torch(image="cat-psych:cpu")` returns the PyTorch version when that image exists locally.
    - `deepseek_scan` succeeds on an allow-listed non-sensitive file and writes `artifacts/deepseek/<run-id>/deepseek-output.md`.
+   - `harness_run_temp_script` can run an artifact-only Python script with `/repo` read-only and `/artifact` writable.
+   - `harness_apply_patch` applies a patch only to an isolated harness worktree, never the real repository.
+   - `harness_run_repo_tests` runs only an allow-listed test template such as `python -m pytest`.
    - `.env`, `.key`, `.git`, token, secret, credential, and private-key paths are rejected.
 
 Important boundary: DeepSeek should be called by the MCP tool backend, not used as the outer Codex driver for MCP testing. In local validation, a DeepSeek-profile outer `codex exec` session did not receive the expected MCP tool-call surface, while the OpenAI/Codex driver could use the registered MCP server.

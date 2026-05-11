@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     REPO_PATH=/repo
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
     && python -m pip install --upgrade pip \
     && python -m pip install mcp docker
